@@ -117,39 +117,6 @@ def compute_response_quality(
     return quality_score
 
 
-def compute_exact_perplexity(
-    model: AutoModelForCausalLM,
-    tokenizer: AutoTokenizer,
-    conversation: dict,
-) -> float:
-    context = get_context(conversation)
-    reference_response = (  # format response with EOS token for proper loss calc
-        f"Assistant: {conversation['conversation'][-1]['value']}{tokenizer.eos_token}"
-    )
-
-    context_ids = tokenizer(context, return_tensors="pt").to(model.device)
-    response_ids = tokenizer(reference_response, return_tensors="pt").to(model.device)
-    full_ids = torch.cat(
-        [context_ids.input_ids, response_ids.input_ids], dim=1
-    )  # combine for full sequence
-    outputs = model(full_ids)
-
-    response_start_index = context_ids.input_ids.size(
-        1
-    )  # where response begins in sequence
-    shift_logits = outputs.logits[
-        :, response_start_index:-1, :
-    ].contiguous()  # align for loss calc
-    shift_labels = response_ids.input_ids[
-        :, 1:
-    ].contiguous()  # shift for next-token prediction
-
-    loss_fct = CrossEntropyLoss(reduction="mean")  # standard language modeling loss
-    loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-
-    return torch.exp(loss).item()  # convert loss to perplexity
-
-
 def compute_response_perplexity(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
@@ -200,7 +167,7 @@ def evaluate_model_on_dataset(
 
     for conversation in dataset:
         if mode == "exact":
-            perplexity = compute_exact_perplexity(model, tokenizer, conversation)
+            perplexity = compute_response_perplexity(model, tokenizer, conversation)
         if mode == "bigram":
             perplexity = compute_response_perplexity(model, tokenizer, conversation)
         if mode == "quality":
@@ -243,21 +210,35 @@ def save_layer_state(
     json.dump(report, open(f"{output_dir}/merge_report.json", "w"), indent=4)
 
 
-def compute_layer_ranks(layer_metrics: Dict[str, Dict[str, float]]) -> Dict[str, float]:
-    """Compute average rank across datasets for each model."""
-    model_names = set().union(*[models.keys() for models in layer_metrics.values()])
+def compute_layer_ranks(layer_metrics: Dict[str, Dict[str, float]], 
+                       metric_weights: Dict[str, float]) -> Dict[str, float]:
+    """
+    Compute weighted rank aggregation across datasets for each model.
+    
+    Args:
+        layer_metrics: Mapping of dataset -> (model -> score) metrics
+        metric_weights: Weight to apply per dataset for rank aggregation
 
+    Returns:
+        Dict mapping model names to their weighted average rank
+    """
+    model_names = set().union(*[models.keys() for models in layer_metrics.values()])
+    total_weight = sum(metric_weights.values())
+    
     model_ranks = {}
     for model_name in model_names:
-        ranks = []
+        weighted_ranks = []
         for dataset_name, dataset_scores in layer_metrics.items():
+            # Get rank within this dataset
             sorted_models = sorted(dataset_scores.items(), key=lambda x: x[1])
-            rank = (
-                next(i for i, (m, _) in enumerate(sorted_models) if m == model_name) + 1
-            )
-            ranks.append(rank)
-        model_ranks[model_name] = sum(ranks) / len(ranks)
-
+            rank = next(i for i, (m, _) in enumerate(sorted_models) if m == model_name) + 1
+            # Apply dataset weight
+            weight = metric_weights[dataset_name]
+            weighted_ranks.append(rank * weight)
+            
+        # Normalize by total weight
+        model_ranks[model_name] = sum(weighted_ranks) / total_weight
+        
     return model_ranks
 
 
@@ -307,6 +288,7 @@ def olm(config: dict) -> str:
                 datasets[dataset_name] = {
                     "data": json.load(f),
                     "mode": dataset_config["mode"],
+                    "weight": dataset_config.get("weight", 1.0),
                 }
     except Exception as e:
         logger.error(f"Failed to load datasets: {e}")
@@ -370,8 +352,9 @@ def olm(config: dict) -> str:
             except Exception as e:
                 logger.error(f"Error testing layer from {model_name}: {e}")
                 continue
-
-        model_ranks = compute_layer_ranks(layer_metrics)
+        
+        metric_weights = {dataset: data["weight"] for dataset, data in datasets.items()}
+        model_ranks = compute_layer_ranks(layer_metrics, metric_weights)
         if not model_ranks:
             logger.error(
                 f"No valid candidates for layer {layer_idx}, skipping optimization"
