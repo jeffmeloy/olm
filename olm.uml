@@ -1,0 +1,114 @@
+@startuml
+skinparam ActivityShape roundBox
+skinparam ActivityBorderThickness 1
+skinparam ArrowThickness 1
+skinparam ActivityDiamondBorderThickness 1
+skinparam ActivityDiamondBackgroundColor white
+skinparam NoteBorderThickness 1
+
+start
+:Load Configuration File;
+note right
+  - Dataset paths and modes
+  - Model paths
+  - Merge direction
+  - Base model name (optional)
+endnote
+
+:Load Datasets;
+note right
+  For each dataset:
+  - exact/bigram/quality mode
+  - data format
+  - sample limit
+endnote
+
+if (Base Model Specified?) then (no)
+  :Auto-Select Base Model;
+  note right
+    Evaluate each model across
+    all datasets to find best
+    initial performer
+  endnote
+endif
+
+:Load Base Model and Tokenizer;
+:Preserve Tokenizer Configuration;
+note right
+  Copy critical files:
+  - tokenizer_config.json
+  - tokenizer.json 
+  - vocab.json
+  - merges.txt
+  - special_tokens_map.json
+endnote
+
+:Determine Layer Processing Order;
+note right
+  Direction options:
+  - Forward (0 → N)
+  - Backward (N → 0)
+endnote
+
+while (More Layers?) is (yes)
+  :Process Next Layer;
+  note right: Layer idx in sequence
+  
+  repeat
+    :Load Candidate Model;
+    :Extract Layer;
+    :Replace Layer in Working Model;
+    
+    partition "Dataset Evaluation" {
+      repeat
+        if (Evaluation Mode?) then (exact)
+          :Compute Exact Perplexity;
+          note right
+            1. Process context
+            2. Evaluate response
+            3. Calculate token-level loss
+          endnote
+        elseif (bigram) then
+          :Compute Bigram Perplexity;
+          note right
+            1. Process context + response
+            2. Calculate bigram transitions
+            3. Combine losses
+          endnote
+        else (quality)
+          :Analyze Response Quality;
+          note right
+            1. Generate response
+            2. Check word diversity
+            3. Detect Chinese chars
+            4. Score length/uniqueness
+          endnote
+        endif
+        :Store Dataset Results;
+      repeat while (More Datasets?) is (yes)
+    }
+    
+    :Compute Average Ranks;
+    note right
+      Rank performance across
+      datasets to normalize
+      different metric scales
+    endnote
+    
+  repeat while (More Models?) is (yes)
+  
+  :Select Best Performing Layer;
+  :Update Working Model;
+  :Save Layer State;
+  note right
+    Update merge_report.json:
+    - Layer metrics
+    - Source model
+    - Dataset performances
+  endnote
+  
+endwhile (no)
+
+:Save Final Merged Model;
+stop
+@startuml
