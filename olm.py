@@ -52,7 +52,7 @@ def get_context2(conversation: dict) -> str:
         if msg["from"] == "system":
             context += f"<|im_start|>system\n{msg['value']}<|im_end|>\n"
         elif msg["from"] == "human":
-            context += f"<|im_start|>human\n{msg['value']}<|im_end|>\n"
+            context += f"<|im_start|>user\n{msg['value']}<|im_end|>\n"
         else:
             context += "<|im_start|>assistant\n"
 
@@ -152,14 +152,52 @@ def compute_response_perplexity(
     return torch.exp(average_loss).item()
 
 
+def compute_exact_match(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    conversation: dict,
+) -> float:
+    """Compute avg losss for the exact response."""
+
+    # get the context and expected response
+    context = get_context2(conversation)
+    expected_response = f"{conversation['conversation'][-1]['value']}"
+    context_ids = tokenizer(context, return_tensors="pt").to(model.device)
+    expected_ids = tokenizer(expected_response, return_tensors="pt").to(model.device)
+
+    # Iterate over each expected token to compute logits
+    current_ids = context_ids.input_ids
+    all_logits = []
+    for i in range(len(expected_ids.input_ids[0])):
+        # Get prediction for the next token
+        outputs = model(current_ids)
+        next_token_logits = outputs.logits[:, -1:, :]
+        all_logits.append(next_token_logits)
+
+    # Calculate average loss
+    response_logits = torch.cat(all_logits, dim=1)
+    labels = expected_ids.input_ids
+    logits_view = response_logits.view(-1, response_logits.size(-1))
+    labels_view = labels.view(-1)
+    loss_fct = CrossEntropyLoss(reduction="none", ignore_index=tokenizer.eos_token_id)
+    token_losses = loss_fct(logits_view, labels_view)
+    total_loss = token_losses.sum()
+    num_tokens = len(token_losses)
+    avg_loss = (total_loss / num_tokens).item()
+
+    return avg_loss
+
+
+# Update evaluate_model_on_dataset
 def evaluate_model_on_dataset(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     dataset: list[dict],
     mode: str,
+    samples: int = 400,
 ) -> float:
-    total_perplexity = 0.0
-    max_conversations = min(len(dataset), 200)
+    total_metric = 0.0
+    max_conversations = min(len(dataset), samples)
     dataset = dataset[:max_conversations]
     model.eval()
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -167,14 +205,14 @@ def evaluate_model_on_dataset(
 
     for conversation in dataset:
         if mode == "exact":
-            perplexity = compute_response_perplexity(model, tokenizer, conversation)
-        if mode == "bigram":
-            perplexity = compute_response_perplexity(model, tokenizer, conversation)
-        if mode == "quality":
-            perplexity = compute_response_quality(model, tokenizer, conversation)
-        total_perplexity += perplexity
+            metric = compute_exact_match(model, tokenizer, conversation)
+        elif mode == "bigram":
+            metric = compute_response_perplexity(model, tokenizer, conversation)
+        elif mode == "quality":
+            metric = compute_response_quality(model, tokenizer, conversation)
+        total_metric += metric
 
-    return total_perplexity / len(dataset)
+    return total_metric / len(dataset)
 
 
 def get_layer(model: AutoModelForCausalLM, layer_idx: int):
@@ -210,67 +248,63 @@ def save_layer_state(
     json.dump(report, open(f"{output_dir}/merge_report.json", "w"), indent=4)
 
 
-def compute_layer_ranks(layer_metrics: Dict[str, Dict[str, float]], 
-                       metric_weights: Dict[str, float]) -> Dict[str, float]:
-    """
-    Compute weighted rank aggregation across datasets for each model.
-    
-    Args:
-        layer_metrics: Mapping of dataset -> (model -> score) metrics
-        metric_weights: Weight to apply per dataset for rank aggregation
+def compute_layer_ranks(
+    layer_metrics: Dict[str, Dict[str, float]],
+    metric_weights: Dict[str, float],
+    improve_all: bool = False,
+) -> Dict[str, float]:
+    """Compute weighted rank aggregation across datasets for each model."""
+    # todo #2: add processing for the "improve_all" mode
+    # if "improve_all" = True, then do the following.abs
+    # 1. get the dataset scores from the last layer for the best model
+    # 2. filter out model pool where any metric scores are higher than the best model in the last layer
+    # 3. compute the rank aggregation for the filtered model pool like current code
+    # 4. if the best model in the last layer is still the best, then use the base model and base model metrics for this layer
 
-    Returns:
-        Dict mapping model names to their weighted average rank
-    """
     model_names = set().union(*[models.keys() for models in layer_metrics.values()])
     total_weight = sum(metric_weights.values())
-    
+
     model_ranks = {}
     for model_name in model_names:
         weighted_ranks = []
         for dataset_name, dataset_scores in layer_metrics.items():
             # Get rank within this dataset
             sorted_models = sorted(dataset_scores.items(), key=lambda x: x[1])
-            rank = next(i for i, (m, _) in enumerate(sorted_models) if m == model_name) + 1
+            rank = (
+                next(i for i, (m, _) in enumerate(sorted_models) if m == model_name) + 1
+            )
             # Apply dataset weight
             weight = metric_weights[dataset_name]
             weighted_ranks.append(rank * weight)
-            
+
         # Normalize by total weight
         model_ranks[model_name] = sum(weighted_ranks) / total_weight
-        
+
     return model_ranks
 
 
-def get_base_model_name(models_dir: str, models: list[str], datasets) -> str:
-    """Select the model with the lowest average perplexity across all datasets."""
-    base_model_name = None
-    base_model_perplexity = float("inf")
-
+def get_base_model_name(models_dir: str, models: list[str], datasets, dataset_weights=None) -> str:
+    #Select the model with the best aggregated rank across all datasets.
+    layer_metrics = {dataset_name: {} for dataset_name in datasets}
     for model_name in models:
         try:
             model_path = Path(models_dir) / model_name.replace("/", "_")
             model, tokenizer = load_model(str(model_path), "cpu")
-            total_perplexity = 0.0
-
             for dataset_name, dataset in datasets.items():
-                perplexity = evaluate_model_on_dataset(
-                    model, tokenizer, dataset["data"], dataset["mode"]
-                )
-                total_perplexity += perplexity
-
-            if total_perplexity < base_model_perplexity:
-                base_model_name = model_name
-                base_model_perplexity = total_perplexity
+                metric = evaluate_model_on_dataset(model, tokenizer, dataset["data"], dataset["mode"])
+                layer_metrics[dataset_name][model_name] = metric
 
             del model
             torch.cuda.empty_cache()
-
+        
         except Exception as e:
             logger.error(f"Error evaluating {model_name}: {e}")
             continue
-
-    return base_model_name
+    
+    metric_weights = {dataset_name: dataset["weight"] if "weight" in dataset else 1.0 for dataset_name, dataset in datasets.items()}
+    model_ranks = compute_layer_ranks(layer_metrics, metric_weights)
+    best_model_name = min(model_ranks, key=model_ranks.get)  
+    return best_model_name
 
 
 def olm(config: dict) -> str:
@@ -321,9 +355,6 @@ def olm(config: dict) -> str:
         else:
             logger.warning(f"Missing expected tokenizer file: {file}")
 
-    working_model, tokenizer = load_model(str(base_path), "cpu")
-    num_layers = working_model.config.num_hidden_layers
-
     # Layer-wise optimization
     for layer_idx in layer_sequence(num_layers, config.get("direction", "forward")):
         logger.info(f"\nOptimizing layer {layer_idx}")
@@ -352,7 +383,7 @@ def olm(config: dict) -> str:
             except Exception as e:
                 logger.error(f"Error testing layer from {model_name}: {e}")
                 continue
-        
+
         metric_weights = {dataset: data["weight"] for dataset, data in datasets.items()}
         model_ranks = compute_layer_ranks(layer_metrics, metric_weights)
         if not model_ranks:
