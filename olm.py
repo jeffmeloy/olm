@@ -2,21 +2,45 @@ import torch
 from torch.nn import CrossEntropyLoss
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import argparse
-from typing import Dict, Iterator
+from typing import Iterator, Optional
 import logging
 from pathlib import Path
 import yaml
 import os
 import json
 import shutil
+from huggingface_hub import snapshot_download
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s > %(message)s")
 logger = logging.getLogger(__name__)
 
 
+def download_model(model_name: str, models_dir: str) -> Optional[str]:
+    """Download model from Hugging Face Hub."""
+    local_path = os.path.join(models_dir, model_name.replace("/", "_"))
+    if not os.path.exists(local_path):
+        print(f"Downloading {model_name} to {local_path}")
+        try:
+            snapshot_download(
+                repo_id=model_name,
+                local_dir=local_path,
+                local_dir_use_symlinks=False,
+                revision="main",
+            )
+            print(f"Successfully downloaded {model_name}")
+        except Exception as e:
+            print(f"Error downloading {model_name}: {e}")
+            return None
+    else:
+        print(f"Model {model_name} already exists at {local_path}")
+
+    return local_path
+
+
 def load_model(
     model_path: str, device: str
 ) -> tuple[AutoModelForCausalLM, AutoTokenizer]:
+    """Load model from local path and return model and tokenizer."""
     try:
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
@@ -32,21 +56,59 @@ def load_model(
         raise
 
 
-def get_context(conversation: dict) -> str:
-    context = ""
-    for msg in conversation["conversation"]:
-        role = (
-            "System: "
-            if msg["from"] == "system"
-            else "Human: "
-            if msg["from"] == "human"
-            else "Assistant: "
+def save_best_model(
+    model_ranks, layer_metrics, layer_idx, models_dir, output_dir, working_model
+):
+    """Save the best model for the current layer."""
+    best_model = min(model_ranks.items(), key=lambda x: x[1])[0]
+    try:
+        best_source = load_model(f"{models_dir}/{best_model.replace('/', '_')}", "cpu")[
+            0
+        ]
+        replace_layer(working_model, get_layer(best_source, layer_idx), layer_idx)
+        save_layer_state(
+            working_model, layer_metrics, layer_idx, output_dir, best_model
         )
-        context += f"{role}{msg['value']}\n"
-    return context
+        del best_source
+        torch.cuda.empty_cache()
+
+        avg_rank = (
+            sum(model_ranks[best_model]) / len(model_ranks[best_model])
+            if isinstance(model_ranks[best_model], list)
+            else model_ranks[best_model]
+        )
+
+        logger.info(
+            f"Applied layer {layer_idx} from {best_model} (avg rank: {avg_rank:.2f})"
+        )
+    except Exception as e:
+        logger.error(f"Error applying best layer from {best_model}: {e}")
+        return
 
 
-def get_context2(conversation: dict) -> str:
+def save_layer_state(
+    model: AutoModelForCausalLM,
+    results: dict,
+    layer_idx: int,
+    output_dir: str,
+    best_model: str,
+) -> None:
+    """Save model state and merge report for current layer."""
+    os.makedirs(output_dir, exist_ok=True)
+    model.save_pretrained(output_dir)
+
+    report = json.load(open(os.path.join(output_dir, "merge_report.json")))
+    report["layers"][str(layer_idx)] = {
+        "metrics": results,
+        "best_model": best_model,
+    }
+    json.dump(
+        report, open(os.path.join(output_dir, "merge_report.json"), "w"), indent=4
+    )
+
+
+def get_context(conversation: dict) -> str:
+    """extract dataset context from conversation."""
     context = ""
     for msg in conversation["conversation"]:
         if msg["from"] == "system":
@@ -65,9 +127,8 @@ def compute_response_quality(
     conversation: dict,
     max_length: int = 2048,
 ) -> float:
-    prompt = get_context2(conversation)
+    prompt = get_context(conversation)
 
-    # Keep the efficient generation setup
     inputs = tokenizer(
         prompt,
         return_tensors="pt",
@@ -90,24 +151,22 @@ def compute_response_quality(
     response_text = tokenizer.decode(new_tokens_ids[0], skip_special_tokens=True)
     logger.info(f"Response: {response_text}")
 
-    # Check for Chinese characters
     if any("\u4e00" <= char <= "\u9fff" for char in response_text):
         chinese_chars = {char for char in response_text if "\u4e00" <= char <= "\u9fff"}
         for char in chinese_chars:
             logger.info(f"Chinese character detected: {char} (U+{ord(char):04X})")
         logger.info("Chinese characters detected in response.")
-        return max_length  # Assign a high metric to penalize
+        return max_length
 
     words = response_text.split()
     total_words = len(words)
-    if total_words < 2:
+    if total_words < 100:
         return max_length
+
     num_words = len(words)
     num_unique_words = len(set(words))
     length_penalty = min(num_words, max_length) / max_length
     repitition_penalty = num_unique_words / num_words
-
-    # penelize more for repitition
     quality_score = 1 / (length_penalty * repitition_penalty**2)
 
     logger.info(
@@ -123,32 +182,30 @@ def compute_response_perplexity(
     conversation: dict,
 ) -> float:
     context = get_context(conversation)
-    response = (  # include EOS token for proper sequence termination
-        f"Assistant: {conversation['conversation'][-1]['value']}{tokenizer.eos_token}"
-    )
+    expected_response = f"{conversation['conversation'][-1]['value']}"
 
     context_ids = tokenizer(context, return_tensors="pt").to(model.device)
-    response_ids = tokenizer(response, return_tensors="pt").to(model.device)
+    response_ids = tokenizer(expected_response, return_tensors="pt").to(model.device)
     full_ids = torch.cat([context_ids.input_ids, response_ids.input_ids], dim=1).to(
         model.device
     )
     outputs = model(full_ids)
 
-    shift_logits = outputs.logits[  # setup for bigram loss calculation
+    shift_logits = outputs.logits[
         :, context_ids.input_ids.size(1) - 1 : -2, :
     ].contiguous()
     next_logits = outputs.logits[:, context_ids.input_ids.size(1) : -1, :].contiguous()
-    shift_labels = response_ids.input_ids[:, :-1].contiguous()  # current tokens
-    next_labels = response_ids.input_ids[:, 1:].contiguous()  # next tokens
+    shift_labels = response_ids.input_ids[:, :-1].contiguous()
+    next_labels = response_ids.input_ids[:, 1:].contiguous()
 
-    loss_fct = CrossEntropyLoss(reduction="none")  # need per-token loss for bigram
-    current_loss = loss_fct(  # loss for current token predictions
+    loss_fct = CrossEntropyLoss(reduction="none")
+    current_loss = loss_fct(
         shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
     )
-    next_loss = loss_fct(  # loss for next token predictions
+    next_loss = loss_fct(
         next_logits.view(-1, next_logits.size(-1)), next_labels.view(-1)
     )
-    average_loss = torch.mean(current_loss + next_loss)  # combine for bigram perplexity
+    average_loss = torch.mean(current_loss + next_loss)
     return torch.exp(average_loss).item()
 
 
@@ -158,23 +215,18 @@ def compute_exact_match(
     conversation: dict,
 ) -> float:
     """Compute avg losss for the exact response."""
-
-    # get the context and expected response
-    context = get_context2(conversation)
+    context = get_context(conversation)
     expected_response = f"{conversation['conversation'][-1]['value']}"
     context_ids = tokenizer(context, return_tensors="pt").to(model.device)
     expected_ids = tokenizer(expected_response, return_tensors="pt").to(model.device)
-
-    # Iterate over each expected token to compute logits
     current_ids = context_ids.input_ids
+
     all_logits = []
     for i in range(len(expected_ids.input_ids[0])):
-        # Get prediction for the next token
         outputs = model(current_ids)
         next_token_logits = outputs.logits[:, -1:, :]
         all_logits.append(next_token_logits)
 
-    # Calculate average loss
     response_logits = torch.cat(all_logits, dim=1)
     labels = expected_ids.input_ids
     logits_view = response_logits.view(-1, response_logits.size(-1))
@@ -188,7 +240,6 @@ def compute_exact_match(
     return avg_loss
 
 
-# Update evaluate_model_on_dataset
 def evaluate_model_on_dataset(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
@@ -196,6 +247,7 @@ def evaluate_model_on_dataset(
     mode: str,
     samples: int = 400,
 ) -> float:
+    """get the average metric for the model on the dataset."""
     total_metric = 0.0
     max_conversations = min(len(dataset), samples)
     dataset = dataset[:max_conversations]
@@ -227,92 +279,86 @@ def layer_sequence(num_layers: int, direction: str) -> Iterator[int]:
     return reversed(range(num_layers)) if direction == "backward" else range(num_layers)
 
 
-def save_layer_state(
-    model: AutoModelForCausalLM,
-    results: dict,
-    layer_idx: int,
-    output_dir: str,
-    best_model: str,
-) -> None:
-    """Save model state and merge report for current layer."""
-    os.makedirs(output_dir, exist_ok=True)
-    model.save_pretrained(output_dir)
+def get_last_layer_idx(merge_report: dict) -> Optional[int]:
+    """Get index of most recently merged layer."""
+    if not merge_report.get("layers"):
+        return None
+    return max(int(layer_num) for layer_num in merge_report["layers"].keys())
 
-    report = (
-        {"layers": {}}
-        if not os.path.exists(f"{output_dir}/merge_report.json")
-        else json.load(open(f"{output_dir}/merge_report.json"))
-    )
-    report["layers"][str(layer_idx)] = results
-    report["layers"][str(layer_idx)]["best_model"] = best_model
-    json.dump(report, open(f"{output_dir}/merge_report.json", "w"), indent=4)
+
+def get_layer_metrics(merge_report: dict, layer_idx: int) -> dict:
+    """Get metrics for specified layer index."""
+    return merge_report["layers"][str(layer_idx)]["metrics"]
+
+
+def compute_model_ranks(
+    model_name: str, layer_metrics: dict, valid_models: set
+) -> list:
+    """Compute rank of model across all datasets."""
+    ranks = []
+    for dataset_scores in layer_metrics.values():
+        valid_scores = {m: s for m, s in dataset_scores.items() if m in valid_models}
+        sorted_models = sorted(valid_scores.items(), key=lambda x: x[1])
+        rank = next(i for i, (m, _) in enumerate(sorted_models) if m == model_name) + 1
+        ranks.append(rank)
+    return ranks
 
 
 def compute_layer_ranks(
-    layer_metrics: Dict[str, Dict[str, float]],
-    metric_weights: Dict[str, float],
-    improve_all: bool = False,
-) -> Dict[str, float]:
-    """Compute weighted rank aggregation across datasets for each model."""
-    # todo #2: add processing for the "improve_all" mode
-    # if "improve_all" = True, then do the following.abs
-    # 1. get the dataset scores from the last layer for the best model
-    # 2. filter out model pool where any metric scores are higher than the best model in the last layer
-    # 3. compute the rank aggregation for the filtered model pool like current code
-    # 4. if the best model in the last layer is still the best, then use the base model and base model metrics for this layer
-
+    layer_metrics: dict[str, dict[str, float]],
+) -> dict[str, float]:
+    """Compute rank aggregation across datasets for each model."""
     model_names = set().union(*[models.keys() for models in layer_metrics.values()])
-    total_weight = sum(metric_weights.values())
-
     model_ranks = {}
     for model_name in model_names:
-        weighted_ranks = []
+        ranks = []
         for dataset_name, dataset_scores in layer_metrics.items():
-            # Get rank within this dataset
             sorted_models = sorted(dataset_scores.items(), key=lambda x: x[1])
             rank = (
                 next(i for i, (m, _) in enumerate(sorted_models) if m == model_name) + 1
             )
-            # Apply dataset weight
-            weight = metric_weights[dataset_name]
-            weighted_ranks.append(rank * weight)
-
-        # Normalize by total weight
-        model_ranks[model_name] = sum(weighted_ranks) / total_weight
-
+            ranks.append(rank)
+        model_ranks[model_name] = ranks
     return model_ranks
 
 
-def get_base_model_name(models_dir: str, models: list[str], datasets, dataset_weights=None) -> str:
-    #Select the model with the best aggregated rank across all datasets.
-    layer_metrics = {dataset_name: {} for dataset_name in datasets}
+def get_base_model_name(
+    models_dir: str, models: list[str], datasets, output_dir
+) -> str:
+    """Select the model with the best aggregated rank across all datasets."""
+    layer_metrics = {dataset_name: {} for dataset_name in datasets.keys()}
+
     for model_name in models:
         try:
             model_path = Path(models_dir) / model_name.replace("/", "_")
+            logger.info(f"Evaluating: {model_name}")
             model, tokenizer = load_model(str(model_path), "cpu")
             for dataset_name, dataset in datasets.items():
-                metric = evaluate_model_on_dataset(model, tokenizer, dataset["data"], dataset["mode"])
-                layer_metrics[dataset_name][model_name] = metric
-
+                # if dataset["mode"] == "quality" then get metric, else remove dataset_name from layer_metrics
+                if dataset["mode"] == "quality":
+                    metric = evaluate_model_on_dataset(
+                        model, tokenizer, dataset["data"], dataset["mode"]
+                    )
+                    # Store metrics in expected structure
+                    layer_metrics[dataset_name][model_name] = metric
+                    logger.info(f"{model_name}: {dataset_name}: {metric}")
+                else:
+                    layer_metrics[dataset_name][model_name] = float("inf")
             del model
             torch.cuda.empty_cache()
-        
+
         except Exception as e:
             logger.error(f"Error evaluating {model_name}: {e}")
             continue
-    
-    metric_weights = {dataset_name: dataset["weight"] if "weight" in dataset else 1.0 for dataset_name, dataset in datasets.items()}
-    model_ranks = compute_layer_ranks(layer_metrics, metric_weights)
-    best_model_name = min(model_ranks, key=model_ranks.get)  
-    return best_model_name
+
+    model_ranks = compute_layer_ranks(layer_metrics)
+    if not model_ranks:
+        raise RuntimeError("No valid base model found")
+    return min(model_ranks, key=model_ranks.get)
 
 
-def olm(config: dict) -> str:
-    """Optimized Layer Merge"""
-    models_dir = config["models_dir"]
-    output_dir = config["output_dir"]
-
-    logger.info("Loading datasets...")
+def get_datasets(config: dict) -> dict:
+    """Load datasets from configuration."""
     datasets = {}
     try:
         for dataset_name, dataset_config in config["dataset"].items():
@@ -322,41 +368,164 @@ def olm(config: dict) -> str:
                 datasets[dataset_name] = {
                     "data": json.load(f),
                     "mode": dataset_config["mode"],
-                    "weight": dataset_config.get("weight", 1.0),
                 }
     except Exception as e:
         logger.error(f"Failed to load datasets: {e}")
         raise
 
-    base_model_name = config.get("base_model_name", None)
+    return datasets
 
+
+def get_base_metrics(
+    base_path, output_dir, base_model_name, datasets, working_model, tokenizer
+) -> None:
+    """Copy base model files and establish baseline metrics."""
+    logger.info(f"Copying base model files to {output_dir}")
+    for file in os.listdir(base_path):
+        if not file.startswith("."):
+            shutil.copy2(os.path.join(base_path, file), os.path.join(output_dir, file))
+
+    logger.info(f"Evaluating {base_model_name} on datasets")
+    base_metrics = {}
+    for dataset_name, dataset in datasets.items():
+        try:
+            metric = evaluate_model_on_dataset(
+                working_model, tokenizer, dataset["data"], dataset["mode"]
+            )
+            base_metrics[dataset_name] = metric
+            logger.info(f"Base model {dataset_name}: {metric:.4f}")
+        except Exception as e:
+            logger.error(f"Error evaluating base model on {dataset_name}: {e}")
+            base_metrics[dataset_name] = float("inf")
+
+    report_path = os.path.join(output_dir, "merge_report.json")
+    report = {}
+    report["base_model"] = {
+        "name": base_model_name,
+        "metrics": base_metrics,
+    }
+    report["layers"] = {}
+
+    json.dump(report, open(report_path, "w"), indent=4)
+    logger.info(f"Base metrics saved to {report_path}")
+
+
+def select_base_model(models_dir: str, models: list[str], datasets: dict) -> str:
+    """Pick best base model using existing ranking functions."""
+    layer_metrics = {dataset_name: {} for dataset_name in datasets}
+
+    for model_name in models:
+        logger.info(f"Evaluating base candidate: {model_name}")
+        try:
+            model, tokenizer = load_model(
+                Path(models_dir) / model_name.replace("/", "_"), "cpu"
+            )
+
+            for dataset_name, dataset in datasets.items():
+                metric = evaluate_model_on_dataset(
+                    model, tokenizer, dataset["data"], dataset["mode"]
+                )
+                layer_metrics[dataset_name][model_name] = metric
+                logger.info(f"{dataset_name}: {metric:.4f}")
+
+            del model
+            torch.cuda.empty_cache()
+
+        except Exception as e:
+            logger.error(f"Error evaluating {model_name}: {e}")
+            continue
+
+    valid_models = set(models)
+    model_ranks = {
+        model: compute_model_ranks(model, layer_metrics, valid_models)
+        for model in valid_models
+        if all(model in scores for scores in layer_metrics.values())
+    }
+
+    if not model_ranks:
+        raise RuntimeError("No valid base models found")
+
+    return min(model_ranks, key=model_ranks.get)
+
+
+def process_model(
+    model_name: str,
+    layer_metrics: dict,
+    datasets: dict,
+    working_model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    base_metrics: dict,
+    merge_report: dict,
+    layer_idx: int,
+    improve_all: str = None,
+) -> dict:
+    """Process model with proper historical metric comparison."""
+    if improve_all:
+        prev_metrics = None
+        last_idx = get_last_layer_idx(merge_report)
+        if last_idx is not None:
+            best_model = merge_report["layers"][str(last_idx)]["best_model"]
+            prev_metrics = {
+                dataset: scores[best_model]
+                for dataset, scores in merge_report["layers"][str(last_idx)][
+                    "metrics"
+                ].items()
+            }
+
+    for dataset_name, dataset in datasets.items():
+        if dataset_name not in layer_metrics:
+            layer_metrics[dataset_name] = {}
+
+        metric = evaluate_model_on_dataset(
+            working_model, tokenizer, dataset["data"], dataset["mode"]
+        )
+        layer_metrics[dataset_name][model_name] = metric
+        logger.info(f"{model_name}: {dataset_name}: {metric:.4f}")
+
+        if (
+            metric > base_metrics[dataset_name]
+            or (prev_metrics and metric > prev_metrics[dataset_name])
+            and (dataset["mode"] == "improve_all" or improve_all == "all")
+        ):
+            logger.info("Layer degradation detected, skip layer")
+            for remaining in datasets:
+                if remaining not in layer_metrics:
+                    layer_metrics[remaining] = {}
+                layer_metrics[remaining][model_name] = float("inf")
+
+            return layer_metrics
+
+    return layer_metrics
+
+
+def olm(config: dict) -> str:
+    models_dir = config["models_dir"]
+    output_dir = config["output_dir"]
+    datasets = get_datasets(config)
+    improve_all = config.get("improve_all", None)
+
+    # download all models to models_dir
+    for model_name in config["models"]:
+        download_model(model_name, models_dir)
+    
+    base_model_name = config.get("base_model_name")
     if not base_model_name:
-        base_model_name = get_base_model_name(models_dir, config["models"], datasets)
+        base_model_name = select_base_model(models_dir, config["models"], datasets)
 
     logger.info(f"Selected base model: {base_model_name}")
-
     base_path = Path(models_dir) / base_model_name.replace("/", "_")
     working_model, tokenizer = load_model(str(base_path), "cpu")
     num_layers = working_model.config.num_hidden_layers
-    logger.info("Preserving base model tokenizer configuration...")
-    tokenizer_files = [
-        "tokenizer_config.json",
-        "tokenizer.json",
-        "vocab.json",
-        "merges.txt",
-        "special_tokens_map.json",
-    ]
-    for file in tokenizer_files:
-        src_path = os.path.join(base_path, file)
-        dst_path = os.path.join(output_dir, file)
-        if os.path.exists(src_path):
-            shutil.copy2(src_path, dst_path)
-            logger.info(f"Preserved {file}")
-        else:
-            logger.warning(f"Missing expected tokenizer file: {file}")
 
-    # Layer-wise optimization
+    report_path = os.path.join(output_dir, "merge_report.json")
+    get_base_metrics(
+        base_path, output_dir, base_model_name, datasets, working_model, tokenizer
+    )
+    merge_report = json.load(open(report_path))
+    base_metrics = merge_report["base_model"]["metrics"]
+
     for layer_idx in layer_sequence(num_layers, config.get("direction", "forward")):
+        merge_report = json.load(open(report_path))
         logger.info(f"\nOptimizing layer {layer_idx}")
         layer_metrics = {dataset: {} for dataset in datasets}
 
@@ -368,47 +537,33 @@ def olm(config: dict) -> str:
                 )[0]
                 replace_layer(working_model, get_layer(source, layer_idx), layer_idx)
                 del source
-                torch.cuda.empty_cache()
 
-                for dataset_name, dataset in datasets.items():
-                    perplexity = evaluate_model_on_dataset(
-                        working_model,
-                        tokenizer,
-                        dataset["data"],
-                        dataset["mode"],
-                    )
-                    layer_metrics[dataset_name][model_name] = perplexity
-                    logger.info(f"{dataset_name}: {perplexity:.4f}")
+                layer_metrics = process_model(
+                    model_name=model_name,
+                    layer_metrics=layer_metrics,
+                    datasets=datasets,
+                    working_model=working_model,
+                    tokenizer=tokenizer,
+                    base_metrics=base_metrics,
+                    merge_report=merge_report,
+                    layer_idx=layer_idx,
+                    improve_all=improve_all,
+                )
 
             except Exception as e:
                 logger.error(f"Error testing layer from {model_name}: {e}")
                 continue
 
-        metric_weights = {dataset: data["weight"] for dataset, data in datasets.items()}
-        model_ranks = compute_layer_ranks(layer_metrics, metric_weights)
+        model_ranks = compute_layer_ranks(layer_metrics)
         if not model_ranks:
             logger.error(
                 f"No valid candidates for layer {layer_idx}, skipping optimization"
             )
             continue
 
-        best_model = min(model_ranks.items(), key=lambda x: x[1])[0]
-        try:
-            best_source = load_model(
-                f"{models_dir}/{best_model.replace('/', '_')}", "cpu"
-            )[0]
-            replace_layer(working_model, get_layer(best_source, layer_idx), layer_idx)
-            save_layer_state(
-                working_model, layer_metrics, layer_idx, output_dir, best_model
-            )
-            del best_source
-            torch.cuda.empty_cache()
-            logger.info(
-                f"Applied layer {layer_idx} from {best_model} (avg rank: {model_ranks[best_model]:.2f})"
-            )
-        except Exception as e:
-            logger.error(f"Error applying best layer from {best_model}: {e}")
-            continue
+        save_best_model(
+            model_ranks, layer_metrics, layer_idx, models_dir, output_dir, working_model
+        )
 
     return output_dir
 
