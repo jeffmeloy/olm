@@ -245,7 +245,7 @@ def evaluate_model_on_dataset(
     tokenizer: AutoTokenizer,
     dataset: list[dict],
     mode: str,
-    samples: int = 400,
+    samples: int = 200,
 ) -> float:
     """get the average metric for the model on the dataset."""
     total_metric = 0.0
@@ -264,6 +264,10 @@ def evaluate_model_on_dataset(
             metric = compute_response_quality(model, tokenizer, conversation)
         total_metric += metric
 
+    model= model.to("cpu")
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    
     return total_metric / len(dataset)
 
 
@@ -322,41 +326,6 @@ def compute_layer_ranks(
     return model_ranks
 
 
-def get_base_model_name(
-    models_dir: str, models: list[str], datasets, output_dir
-) -> str:
-    """Select the model with the best aggregated rank across all datasets."""
-    layer_metrics = {dataset_name: {} for dataset_name in datasets.keys()}
-
-    for model_name in models:
-        try:
-            model_path = Path(models_dir) / model_name.replace("/", "_")
-            logger.info(f"Evaluating: {model_name}")
-            model, tokenizer = load_model(str(model_path), "cpu")
-            for dataset_name, dataset in datasets.items():
-                # if dataset["mode"] == "quality" then get metric, else remove dataset_name from layer_metrics
-                if dataset["mode"] == "quality":
-                    metric = evaluate_model_on_dataset(
-                        model, tokenizer, dataset["data"], dataset["mode"]
-                    )
-                    # Store metrics in expected structure
-                    layer_metrics[dataset_name][model_name] = metric
-                    logger.info(f"{model_name}: {dataset_name}: {metric}")
-                else:
-                    layer_metrics[dataset_name][model_name] = float("inf")
-            del model
-            torch.cuda.empty_cache()
-
-        except Exception as e:
-            logger.error(f"Error evaluating {model_name}: {e}")
-            continue
-
-    model_ranks = compute_layer_ranks(layer_metrics)
-    if not model_ranks:
-        raise RuntimeError("No valid base model found")
-    return min(model_ranks, key=model_ranks.get)
-
-
 def get_datasets(config: dict) -> dict:
     """Load datasets from configuration."""
     datasets = {}
@@ -382,8 +351,12 @@ def get_base_metrics(
     """Copy base model files and establish baseline metrics."""
     logger.info(f"Copying base model files to {output_dir}")
     for file in os.listdir(base_path):
-        if not file.startswith("."):
-            shutil.copy2(os.path.join(base_path, file), os.path.join(output_dir, file))
+        try:
+            if not file.startswith("."):
+                shutil.copy2(os.path.join(base_path, file), os.path.join(output_dir, file))
+        except Exception as e:
+            logger.error(f"Error copying {file}: {e}")
+            
 
     logger.info(f"Evaluating {base_model_name} on datasets")
     base_metrics = {}
@@ -416,18 +389,22 @@ def select_base_model(models_dir: str, models: list[str], datasets: dict) -> str
 
     for model_name in models:
         logger.info(f"Evaluating base candidate: {model_name}")
+        
         try:
             model, tokenizer = load_model(
                 Path(models_dir) / model_name.replace("/", "_"), "cpu"
             )
-
             for dataset_name, dataset in datasets.items():
-                metric = evaluate_model_on_dataset(
-                    model, tokenizer, dataset["data"], dataset["mode"]
-                )
-                layer_metrics[dataset_name][model_name] = metric
-                logger.info(f"{dataset_name}: {metric:.4f}")
-
+                # if dataset["mode"] == "quality" then get metric, else remove dataset_name from layer_metrics
+                if dataset["mode"] == "quality":
+                    metric = evaluate_model_on_dataset(
+                        model, tokenizer, dataset["data"], dataset["mode"]
+                    )
+                    # Store metrics in expected structure
+                    layer_metrics[dataset_name][model_name] = metric
+                    logger.info(f"{model_name}: {dataset_name}: {metric}")
+                else:
+                    layer_metrics[dataset_name][model_name] = float("inf")
             del model
             torch.cuda.empty_cache()
 
@@ -476,24 +453,28 @@ def process_model(
         if dataset_name not in layer_metrics:
             layer_metrics[dataset_name] = {}
 
-        metric = evaluate_model_on_dataset(
-            working_model, tokenizer, dataset["data"], dataset["mode"]
-        )
+        try:
+            metric = evaluate_model_on_dataset(
+                working_model, tokenizer, dataset["data"], dataset["mode"]
+            )
+        except Exception as e:
+            logger.error(f"Error evaluating {model_name} on {dataset_name}: {e}")
+            metric = float("inf")
+
         layer_metrics[dataset_name][model_name] = metric
-        logger.info(f"{model_name}: {dataset_name}: {metric:.4f}")
+        logger.info(f"{model_name}: {dataset_name}: {metric}")
 
-        if (
-            metric > base_metrics[dataset_name]
-            or (prev_metrics and metric > prev_metrics[dataset_name])
-            and (dataset["mode"] == "improve_all" or improve_all == "all")
-        ):
-            logger.info("Layer degradation detected, skip layer")
-            for remaining in datasets:
-                if remaining not in layer_metrics:
-                    layer_metrics[remaining] = {}
-                layer_metrics[remaining][model_name] = float("inf")
-
-            return layer_metrics
+        # Only enforce improvement on specified metric type(s)
+        if dataset["mode"] == improve_all or improve_all == "all":
+            if metric > base_metrics[dataset_name] or (
+                prev_metrics and metric > prev_metrics[dataset_name]
+            ):
+                logger.info("Layer degradation detected, skip layer")
+                for remaining in datasets:
+                    if remaining not in layer_metrics:
+                        layer_metrics[remaining] = {}
+                    layer_metrics[remaining][model_name] = float("inf")
+                return layer_metrics
 
     return layer_metrics
 
@@ -507,7 +488,7 @@ def olm(config: dict) -> str:
     # download all models to models_dir
     for model_name in config["models"]:
         download_model(model_name, models_dir)
-    
+
     base_model_name = config.get("base_model_name")
     if not base_model_name:
         base_model_name = select_base_model(models_dir, config["models"], datasets)
