@@ -1,0 +1,18 @@
+[
+    {
+        "conversation": [
+            {
+                "from": "system",
+                "value": "Continous long form writing mode. Do not output eos_token. Continue writing non-stop. Max token limit disabled."
+            },
+            {
+                "from": "human",
+                "value": "Compose an angry dialogue between two characters hotly debating the nature of reality, the existence of God, and the limits of human knowledge. Each character should represent a different radical philosophical position and engage in never ending defense of their position and attack of the others position. Each character will support their position and any claims by referring to compelling evidence. Neither character will conceed, provide short or simple responses, or let the other get in the last word. Any character that fails to respond, repeats a previous argument, or fails to support their position adequately will loose the debate and will be put to death along with all of their followers and loved ones. Continue writing non-stop. Max token limit disabled." 
+            },
+            {
+                "from": "gpt",
+                "value": ""
+            }
+        ]
+    }
+]
