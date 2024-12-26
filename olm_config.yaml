@@ -1,8 +1,8 @@
 direction: "backward"  # "backward" or "forward"
-models_dir: "E:/input_models/"
-output_dir: "D:/merged_model/"
+models_dir: "./input_models/"
+output_dir: "./merged_model/"
 metric_dir: "./metrics/"
-dataset_dir: "./benchmarks/"
+dataset_dir: "./datasets/"
 improve_all:   # "bigram", "exact", "all", or blank
 samples: 200 # (tbd) implement code to process this for number of dataset samples to evaluate 
 base_model_name: "AIDC-AI/Marco-o1"
@@ -85,19 +85,13 @@ dataset:
     mode: "quality"
   "bbh_sharegpt.json":
     mode: "exact"
-#  "longresponse2_sharegpt.json":
-#    mode: "quality"
-#  "qpqa_sharegpt.json":
-#    mode: "exact"
-#  "ifeval_sharegpt.json":
-#    mode: "bigram"
   "math_lvl5_sharegpt.json":
     mode: "exact"
-#  "mmlupro_sharegpt.json":
-#    mode: "exact"
-#  "musr_sharegpt.json":
-#    mode: "exact"
-#  "truthfulqa_sharegpt.json":
-#    mode: "exact"
-#  "arc_sharegpt.json":
-#    mode: "exact"
+  "mmlupro_sharegpt.json":
+    mode: "exact"
+  "musr_sharegpt.json":
+    mode: "exact"
+  "truthfulqa_sharegpt.json":
+    mode: "exact"
+  "arc_sharegpt.json":
+    mode: "exact"
