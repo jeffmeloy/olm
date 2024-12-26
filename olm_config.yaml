@@ -2,7 +2,7 @@ direction: "backward"  # "backward" or "forward"
 models_dir: "./input_models/"
 output_dir: "./merged_model/"
 metric_dir: "./metrics/"
-dataset_dir: "./datasets/"
+dataset_dir: "./dataset/"
 improve_all:   # "bigram", "exact", "all", or blank
 samples: 200 # (tbd) implement code to process this for number of dataset samples to evaluate 
 base_model_name: "AIDC-AI/Marco-o1"
