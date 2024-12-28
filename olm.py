@@ -57,10 +57,15 @@ def load_model(
 
 
 def save_best_model(
-    model_ranks, layer_metrics, layer_idx, models_dir, output_dir, working_model
-):
+    model_ranks: dict[str, list[int]],
+    layer_metrics: dict[str, dict[str, float]],
+    layer_idx: int,
+    models_dir: str,
+    output_dir: str,
+    working_model: AutoModelForCausalLM,
+) -> None:
     """Save the best model for the current layer."""
-    best_model = min(model_ranks.items(), key=lambda x: x[1])[0]
+    best_model = min(model_ranks.items(), key=lambda x: sum(x[1]))[0]
     try:
         best_source = load_model(f"{models_dir}/{best_model.replace('/', '_')}", "cpu")[
             0
@@ -264,10 +269,10 @@ def evaluate_model_on_dataset(
             metric = compute_response_quality(model, tokenizer, conversation)
         total_metric += metric
 
-    model= model.to("cpu")
+    model = model.to("cpu")
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
-    
+
     return total_metric / len(dataset)
 
 
@@ -353,10 +358,11 @@ def get_base_metrics(
     for file in os.listdir(base_path):
         try:
             if not file.startswith("."):
-                shutil.copy2(os.path.join(base_path, file), os.path.join(output_dir, file))
+                shutil.copy2(
+                    os.path.join(base_path, file), os.path.join(output_dir, file)
+                )
         except Exception as e:
             logger.error(f"Error copying {file}: {e}")
-            
 
     logger.info(f"Evaluating {base_model_name} on datasets")
     base_metrics = {}
@@ -389,7 +395,7 @@ def select_base_model(models_dir: str, models: list[str], datasets: dict) -> str
 
     for model_name in models:
         logger.info(f"Evaluating base candidate: {model_name}")
-        
+
         try:
             model, tokenizer = load_model(
                 Path(models_dir) / model_name.replace("/", "_"), "cpu"
