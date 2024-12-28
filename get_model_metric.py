@@ -4,683 +4,342 @@ import os
 import sqlite3
 import bz2
 from pathlib import Path
-from typing import Optional, Tuple
-
+from typing import Optional
 import numpy as np
 import torch
 import yaml
 from huggingface_hub import snapshot_download
-from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer
-import tempfile
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import uuid
+import logging
+import shutil
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 
-"""
-1. Load a complete Hugging Face model (architecture and weights) from an SQLite database 
-    created by the `save_model_to_database` and `save_model_artifacts` functions.
-2. Load a Hugging Face tokenizer from the database, reconstructing the necessary files.
+def transfer_files_to_temp_dir(
+    model_name: str, database_dir: str, temp_dir: Path, file_keys: list[str]
+) -> bool:
+    """Transfers specified files from the database to a temporary directory."""
+    model_data = load_model_data(model_name, database_dir)
 
-The database is assumed to have the following table structure (created by the original code):
+    for key in file_keys:
+        data = model_data.get(key)
+        if not data:
+            logger.error(f"Data for {key} not found in the database for {model_name}.")
+            return False
 
--   `models`: Stores general model information, including configuration files as TEXT.
-    -   `model_id` (INTEGER PRIMARY KEY)
-    -   `model_name` (TEXT UNIQUE NOT NULL)
-    -   `config_json` (TEXT)
-    -   `tokenizer_json` (TEXT)
-    -   `tokenizer_config_json` (TEXT)
-    -   `special_tokens_map_json` (TEXT)
-    -   `vocab_json` (TEXT)
-    -   ... (other columns)
--   `layers`: Stores layer-specific information, including weights as BLOBs.
-    -   `layer_id` (INTEGER PRIMARY KEY)
-    -   `model_id` (INTEGER, FOREIGN KEY referencing `models.model_id`)
-    -   `layer_name` (TEXT)
-    -   `layer_tensor` (BLOB)
-    -   `tensor_shape` (TEXT)
-    -   ... (other columns)
--   `positional_embeddings`: Stores positional embedding data (if available).
-    -   `embedding_id` (INTEGER PRIMARY KEY)
-    -   `model_id` (INTEGER, FOREIGN KEY referencing `models.model_id`)
-    -   `embedding_data` (BLOB)
-    -   ... (other columns)
+        file_path = temp_dir / f"{key}.json"
+        with open(file_path, "w") as f:
+            f.write(data)
 
-"""
+    return True
 
 
-def load_model_from_database(
-    model_name: str, database_dir: str
-) -> Optional[AutoModelForCausalLM]:
-    """Loads a model from the database.
-
-    Args:
-        model_name: The name of the model to load.
-        database_dir: The directory where the database is located.
-
-    Returns:
-        The loaded Hugging Face model object, or None if an error occurred.
-    """
-    db_path = Path(database_dir) / "models.db"
-    with sqlite3.connect(db_path) as conn:
-        cursor = conn.cursor()
-
-        # 1. Get Model Configuration
-        cursor.execute(
-            "SELECT model_type, config_json FROM models WHERE model_name = ?",
-            (model_name,),
-        )
-        result = cursor.fetchone()
-        if not result:
-            print(f"Model {model_name} not found in database")
-            return None
-
-        model_type, config_json = result
-        try:
-            config = AutoConfig.from_dict(json.loads(config_json))
-            model = AutoModelForCausalLM.from_config(
-                config, torch_dtype=torch.bfloat16, device_map="auto"
-            )
-        except Exception as e:
-            print(f"Error initializing model from config: {e}")
-            return None
-
-        # 2. Get Model ID
-        model_id = _get_model_id(cursor, model_name)
-
-        # 3. Load Layer Weights and Metadata
-        cursor.execute(
-            """
-            SELECT layer_name, layer_tensor, tensor_shape, dtype, metadata_json
-            FROM layers
-            WHERE model_id = ?
-        """,
-            (model_id,),
-        )
-        for layer_name, tensor_bytes, shape_json, dtype_str, metadata_json in cursor.fetchall():
-            try:
-                tensor_shape = json.loads(shape_json)
-                tensor_dtype = getattr(torch, dtype_str.split(".")[-1])
-                tensor = torch.from_numpy(
-                    np.frombuffer(tensor_bytes, dtype=np.float32).reshape(tensor_shape)
-                ).to(dtype=tensor_dtype)
-
-                layer_module = _get_module_by_name(model, layer_name)
-                if layer_module:
-                    layer_module.weight.data = tensor
-                    metadata = json.loads(metadata_json)
-                    if metadata.get("bias") is not None:
-                        layer_module.bias.data = torch.tensor(
-                            metadata["bias"], dtype=tensor_dtype, device=tensor.device
-                        )
-            except Exception as e:
-                print(f"Error loading layer {layer_name}: {e}")
-                return None
-
-        # 4. Load Positional Embeddings (if present)
-        cursor.execute(
-            "SELECT embedding_data, embedding_config_json FROM positional_embeddings WHERE model_id = ?",
-            (model_id,),
-        )
-        pos_emb_row = cursor.fetchone()
-        if pos_emb_row and hasattr(model, "set_position_embeddings"):
-            emb_data, emb_config_json = pos_emb_row
-            try:
-                pos_emb = torch.from_numpy(np.frombuffer(emb_data, dtype=np.float32))
-                model.set_position_embeddings(pos_emb)
-            except Exception as e:
-                print(f"Error loading positional embeddings: {e}")
-                return None
-
-        return model
-
-def load_tokenizer_from_database(
-    model_name: str, database_dir: str, output_dir: Optional[str] = None
-) -> Tuple[Optional[AutoTokenizer], Optional[Path]]:
-    """Loads a tokenizer from the database.
-
-    Args:
-        model_name: The name of the model whose tokenizer to load.
-        database_dir: The directory where the database is located.
-        output_dir: Optional directory to save the tokenizer files to. 
-                    If None, a temporary directory will be used.
-
-    Returns:
-        A tuple containing:
-        - The loaded Hugging Face tokenizer object, or None if an error occurred.
-        - The path to the directory containing the tokenizer files.
-    """
-    db_path = Path(database_dir) / "models.db"
-    with sqlite3.connect(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT
-                tokenizer_json,
-                tokenizer_config_json,
-                special_tokens_map_json,
-                vocab_json
-            FROM models
-            WHERE model_name = ?
-        """,
-            (model_name,),
-        )
-        row = cursor.fetchone()
-        if not row:
-            print(f"Tokenizer data not found for model {model_name} in database")
-            return None, None
-
-        tokenizer_json, tokenizer_config_json, special_tokens_map_json, vocab_json = row
-
-        # Create a temporary or specified directory for tokenizer files
-        if output_dir:
-            tokenizer_dir = Path(output_dir) / f"{model_name.replace('/', '_')}_tokenizer"
+def clear_temp_directory(temp_dir: Path) -> None:
+    """Clears all files and directories within the temporary directory."""
+    for item in temp_dir.iterdir():
+        if item.is_dir():
+            shutil.rmtree(item)
         else:
-            tokenizer_dir = Path(tempfile.mkdtemp()) / f"{model_name.replace('/', '_')}_tokenizer"
-        tokenizer_dir.mkdir(parents=True, exist_ok=True)
-
-        # Write tokenizer files to the directory
-        try:
-            if tokenizer_json:
-                with open(tokenizer_dir / "tokenizer.json", "w", encoding="utf-8") as f:
-                    f.write(tokenizer_json)
-            if tokenizer_config_json:
-                with open(tokenizer_dir / "tokenizer_config.json", "w", encoding="utf-8") as f:
-                    f.write(tokenizer_config_json)
-            if special_tokens_map_json:
-                with open(tokenizer_dir / "special_tokens_map.json", "w", encoding="utf-8") as f:
-                    f.write(special_tokens_map_json)
-            if vocab_json:
-                with open(tokenizer_dir / "vocab.json", "w", encoding="utf-8") as f:
-                    f.write(vocab_json)
-
-        except Exception as e:
-            print(f"Error writing tokenizer files to {tokenizer_dir}: {e}")
-            return None, None
-
-        # Load the tokenizer from the directory
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
-            return tokenizer, tokenizer_dir
-        except Exception as e:
-            print(f"Error loading tokenizer from {tokenizer_dir}: {e}")
-            return None, None
-
-# --- Helper Functions ---
-
-def _get_model_id(cursor: sqlite3.Cursor, model_name: str) -> int:
-    """Helper function to get model_id from the database."""
-    cursor.execute("SELECT model_id FROM models WHERE model_name = ?", (model_name,))
-    result = cursor.fetchone()
-    if not result:
-        raise ValueError(f"Model {model_name} not found in database")
-    return result[0]
-
-def _get_module_by_name(
-    model: torch.nn.Module, module_name: str
-) -> Optional[torch.nn.Module]:
-    """Helper function to get a module by its hierarchical name."""
-    for name, module in model.named_modules():
-        if name == module_name:
-            return module
-    return None
+            item.unlink()
 
 
+def get_model_from_db(
+    model_name: str, database_dir: str, device: str = "cpu"
+) -> Optional[AutoModelForCausalLM]:
+    """Loads a model from the database to the specified device (default: CPU)"""
+    temp_dir = Path(database_dir) / "temp_model_files"
+    temp_dir.mkdir(exist_ok=True)
+    clear_temp_directory(temp_dir)
+    if not transfer_files_to_temp_dir(model_name, database_dir, temp_dir, ["config"]):
+        return None  # Transfer failed
+
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            str(temp_dir),
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+            device_map={"": device},
+        )
+    except Exception as e:
+        logger.error(f"Error loading model from temporary directory: {e}")
+        return None
+
+    tensors_data = load_tensors_and_metrics(model_name, database_dir)
+    for name, tensor_data in tensors_data.items():
+        with torch.no_grad():
+            param = model.get_parameter(name)
+            if param is not None:
+                # Ensure tensor is on CPU before copying
+                param.copy_(tensor_data["tensor"].to("cpu"))
+
+    return model
+
+
+def get_tokenizer_from_db(
+    model_name: str, database_dir: str
+) -> Optional[AutoTokenizer]:
+    """Loads a tokenizer from the database."""
+    temp_dir = Path(database_dir) / "temp_model_files"
+    temp_dir.mkdir(exist_ok=True)
+    clear_temp_directory(temp_dir)  # Clear temp directory before transferring files
+
+    if not transfer_files_to_temp_dir(
+        model_name, database_dir, temp_dir, ["tokenizer_config", "tokenizer"]
+    ):
+        return None  # Transfer failed
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(str(temp_dir))
+    except Exception as e:
+        logger.error(f"Error loading tokenizer from temporary directory: {e}")
+        return None
+
+    return tokenizer
 
 
 def init_database(database_dir: str) -> None:
-    """Initializes the SQLite database."""
+    """Initializes the SQLite database with improved schema."""
     db_path = Path(database_dir) / "models.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db_path) as conn:
-        conn.executescript(
-            """
+        conn.executescript("""
             CREATE TABLE IF NOT EXISTS models (
-                model_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model_id TEXT PRIMARY KEY,  -- UUID string
                 model_name TEXT UNIQUE NOT NULL,
-                model_type TEXT NOT NULL,
-                config_json TEXT NOT NULL,
+                config_json TEXT,
                 tokenizer_json TEXT,
                 tokenizer_config_json TEXT,
-                special_tokens_map_json TEXT,
                 vocab_json TEXT,
                 generation_config_json TEXT,
-                model_card_json TEXT,
-                version TEXT NOT NULL,
-                creation_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                added_tokens_json TEXT,
+                special_tokens_map_json TEXT
             );
 
-            CREATE TABLE IF NOT EXISTS layers (
-                layer_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                model_id INTEGER NOT NULL,
-                layer_name TEXT NOT NULL,
-                layer_type TEXT NOT NULL,
-                layer_tensor BLOB NOT NULL,
+            CREATE TABLE IF NOT EXISTS tensors (
+                tensor_id TEXT PRIMARY KEY,  -- UUID string
+                model_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                tensor_data BLOB NOT NULL,
                 tensor_shape TEXT NOT NULL,
-                dtype TEXT NOT NULL,
-                device TEXT NOT NULL,
-                requires_grad BOOLEAN NOT NULL,
-                metadata_json TEXT,
-                layer_config_json TEXT,
-                FOREIGN KEY (model_id) REFERENCES models(model_id),
-                UNIQUE(model_id, layer_name)
+                tensor_dtype TEXT NOT NULL,
+                FOREIGN KEY(model_id) REFERENCES models(model_id),
+                UNIQUE(model_id, name)
             );
 
-            CREATE TABLE IF NOT EXISTS attention_configs (
-                attention_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                layer_id INTEGER NOT NULL,
-                num_attention_heads INTEGER NOT NULL,
-                attention_config_json TEXT NOT NULL,
-                FOREIGN KEY (layer_id) REFERENCES layers(layer_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS positional_embeddings (
-                embedding_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                model_id INTEGER NOT NULL,
-                embedding_type TEXT NOT NULL,
-                embedding_data BLOB NOT NULL,
-                embedding_config_json TEXT NOT NULL,
-                FOREIGN KEY (model_id) REFERENCES models(model_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS metrics (
-                metric_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                layer_id INTEGER NOT NULL,
+            CREATE TABLE IF NOT EXISTS tensor_metrics (
+                tensor_id TEXT NOT NULL,
                 metric_name TEXT NOT NULL,
                 metric_value REAL NOT NULL,
-                calculation_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (layer_id) REFERENCES layers(layer_id),
-                UNIQUE(layer_id, metric_name)
+                FOREIGN KEY(tensor_id) REFERENCES tensors(tensor_id),
+                UNIQUE(tensor_id, metric_name)
             );
-
-            CREATE TABLE IF NOT EXISTS model_versions (
-                version_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                model_id INTEGER NOT NULL,
-                version_number TEXT NOT NULL,
-                commit_hash TEXT,
-                version_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (model_id) REFERENCES models(model_id)
-            );
-        """
-        )
-
-def _insert_or_update_model_record(
-    cursor: sqlite3.Cursor, model_name: str, model_data: dict
-):
-    """Inserts or updates a model record in the database."""
-    cursor.execute(
-        """
-        INSERT OR REPLACE INTO models (
-            model_name, model_type, config_json, tokenizer_json, tokenizer_config_json,
-            special_tokens_map_json, vocab_json, generation_config_json, model_card_json, version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """,
-        (
-            model_name,
-            model_data.get("model_type"),
-            model_data.get("config_json"),
-            model_data.get("tokenizer_json"),
-            model_data.get("tokenizer_config_json"),
-            model_data.get("special_tokens_map_json"),
-            model_data.get("vocab_json"),
-            model_data.get("generation_config_json"),
-            model_data.get("model_card_json"),
-            model_data.get("version", "1.0"),
-        ),
-    )
+        """)
 
 
-def save_model_to_database(
-    model: AutoModelForCausalLM, model_name: str, database_dir: str
-):
-    """Saves model information to the database."""
-    db_path = Path(database_dir) / "models.db"
-    with sqlite3.connect(db_path) as conn:
-        cursor = conn.cursor()
-        try:
-            model_data = {
-                "model_type": model.__class__.__name__,
-                "config_json": json.dumps(model.config.to_dict()),
-                "version": "1.0",
-            }
-            _insert_or_update_model_record(cursor, model_name, model_data)
-            model_id = _get_model_id(cursor, model_name)
-
-            for layer_name, module in model.named_modules():
-                if hasattr(module, "weight"):
-                    _save_layer_data(cursor, model_id, layer_name, module)
-                    if hasattr(module, "num_attention_heads"):
-                        _save_attention_config(cursor, cursor.lastrowid, module)
-
-            if hasattr(model, "get_position_embeddings"):
-                _save_positional_embeddings(cursor, model_id, model)
-
-        except Exception as e:
-            print(f"Error saving model {model_name} to database: {e}")
-            conn.rollback()
-            raise
-
-
-def _save_layer_data(
-    cursor: sqlite3.Cursor,
-    model_id: int,
-    layer_name: str,
-    module: torch.nn.Module,
-):
-    """Saves layer data to the database."""
-    tensor = module.weight.data
-    metadata = {
-        "bias": module.bias.data.cpu().numpy().tolist()
-        if hasattr(module, "bias") and module.bias is not None
-        else None,
-        "in_features": getattr(module, "in_features", None),
-        "out_features": getattr(module, "out_features", None),
-        "activation_function": getattr(
-            module, "activation_function", None
-        ).__class__.__name__
-        if hasattr(module, "activation_function")
-        else None,
-    }
-    layer_config = _get_layer_config(module)
-    cursor.execute(
-        """
-        INSERT OR REPLACE INTO layers (
-            model_id, layer_name, layer_type, layer_tensor, tensor_shape, dtype,
-            device, requires_grad, metadata_json, layer_config_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """,
-        (
-            model_id,
-            layer_name,
-            module.__class__.__name__,
-            tensor.cpu().numpy().tobytes(),
-            json.dumps(list(tensor.shape)),
-            str(tensor.dtype),
-            str(tensor.device),
-            tensor.requires_grad,
-            json.dumps(metadata),
-            json.dumps(layer_config),
-        ),
-    )
-
-
-def _get_layer_config(module: torch.nn.Module) -> dict:
-    """Extracts layer configuration based on layer type."""
-    if hasattr(module, "config"):
-        return module.config.to_dict()
-    elif isinstance(module, torch.nn.Linear):
-        return {
-            "in_features": module.in_features,
-            "out_features": module.out_features,
-            "bias": module.bias is not None,
-        }
-    elif isinstance(module, torch.nn.LayerNorm):
-        return {
-            "normalized_shape": module.normalized_shape,
-            "eps": module.eps,
-            "elementwise_affine": module.elementwise_affine,
-        }
-    return {}
-
-
-def _save_attention_config(
-    cursor: sqlite3.Cursor, layer_id: int, module: torch.nn.Module
-):
-    """Saves attention configuration to the database."""
-    attention_config = {
-        "num_attention_heads": module.num_attention_heads,
-        "attention_head_size": getattr(module, "attention_head_size", None),
-        "attention_dropout": getattr(module, "attention_dropout", None),
-        "attention_type": getattr(module, "attention_type", "default"),
-    }
-    cursor.execute(
-        """
-        INSERT OR REPLACE INTO attention_configs (
-            layer_id, num_attention_heads, attention_config_json
-        ) VALUES (?, ?, ?)
-    """,
-        (layer_id, module.num_attention_heads, json.dumps(attention_config)),
-    )
-
-
-def _save_positional_embeddings(
-    cursor: sqlite3.Cursor, model_id: int, model: AutoModelForCausalLM
-):
-    """Saves positional embeddings to the database."""
-    pos_emb = model.get_position_embeddings()
-    if pos_emb is not None:
-        emb_config = {
-            "max_position_embeddings": getattr(
-                model.config, "max_position_embeddings", None
-            ),
-            "position_embedding_type": getattr(
-                model.config, "position_embedding_type", "absolute"
-            ),
-        }
-        cursor.execute(
-            """
-            INSERT OR REPLACE INTO positional_embeddings (
-                model_id, embedding_type, embedding_data, embedding_config_json
-            ) VALUES (?, ?, ?, ?)
-        """,
-            (
-                model_id,
-                emb_config["position_embedding_type"],
-                pos_emb.cpu().numpy().tobytes(),
-                json.dumps(emb_config),
-            ),
-        )
-
-
-def save_model_artifacts(model_path: str, model_name: str, database_dir: str):
-    """Saves model artifacts (config files) to the database."""
-    db_path = Path(database_dir) / "models.db"
-    model_path = Path(model_path)
-    with sqlite3.connect(db_path) as conn:
-        cursor = conn.cursor()
-        try:
-            artifacts = {}
-            for filename in [
-                "config.json",
-                "tokenizer.json",
-                "tokenizer_config.json",
-                "special_tokens_map.json",
-                "vocab.json",
-                "generation_config.json",
-                "README.md",
-            ]:
-                filepath = model_path / filename
-                if filepath.exists():
-                    with open(filepath, "r", encoding="utf-8") as f:
-                        artifacts[filename.replace(".", "_")] = f.read()
-                else:
-                    artifacts[filename.replace(".", "_")] = None
-
-            # Determine model type
-            model_type = "AutoModelForCausalLM"  # Default, can be refined
-            if artifacts["config_json"]:
-                config_data = json.loads(artifacts["config_json"])
-                model_type = config_data.get("_name_or_path", model_type)
-
-            model_data = {
-                "model_type": model_type,
-                "config_json": artifacts["config_json"],
-                "tokenizer_json": artifacts["tokenizer_json"],
-                "tokenizer_config_json": artifacts["tokenizer_config_json"],
-                "special_tokens_map_json": artifacts["special_tokens_map_json"],
-                "vocab_json": artifacts["vocab_json"],
-                "generation_config_json": artifacts["generation_config_json"],
-                "model_card_json": artifacts["README_md"],
-                "version": "1.0",
-            }
-            _insert_or_update_model_record(cursor, model_name, model_data)
-
-        except Exception as e:
-            print(f"Error saving model artifacts for {model_name} to database: {e}")
-            conn.rollback()
-            raise
-
-
-def load_model_artifacts(model_name: str, output_dir: str, database_dir: str) -> Path:
-    """Loads model artifacts from the database and reconstructs the model directory."""
+def load_model_data(model_name: str, database_dir: str) -> dict:
+    """Loads model configuration data from the database with new schema."""
     db_path = Path(database_dir) / "models.db"
     with sqlite3.connect(db_path) as conn:
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT
-                config_json, tokenizer_json, tokenizer_config_json,
-                special_tokens_map_json, vocab_json, generation_config_json,
-                model_card_json
-            FROM models WHERE model_name = ?
-        """,
+            SELECT model_id, config_json, tokenizer_json, tokenizer_config_json,
+                   vocab_json, generation_config_json, added_tokens_json,
+                   special_tokens_map_json
+            FROM models 
+            WHERE model_name = ?
+            """,
             (model_name,),
         )
+
         row = cursor.fetchone()
         if not row:
             raise ValueError(f"Model {model_name} not found in database")
 
-        model_dir = Path(output_dir) / model_name.replace("/", "_")
-        model_dir.mkdir(parents=True, exist_ok=True)
-
-        artifacts = {
-            "config.json": row[0],
-            "tokenizer.json": row[1],
-            "tokenizer_config.json": row[2],
-            "special_tokens_map.json": row[3],
-            "vocab.json": row[4],
-            "generation_config.json": row[5],
-            "README.md": row[6],
+        return {
+            "model_id": row[0],
+            "config": json.loads(row[1]) if row[1] else None,
+            "tokenizer": json.loads(row[2]) if row[2] else None,
+            "tokenizer_config": json.loads(row[3]) if row[3] else None,
+            "vocab": json.loads(row[4]) if row[4] else None,
+            "generation_config": json.loads(row[5]) if row[5] else None,
+            "added_tokens": json.loads(row[6]) if row[6] else None,
+            "special_tokens_map": json.loads(row[7]) if row[7] else None,
         }
-        for filename, content in artifacts.items():
-            if content:
-                with open(model_dir / filename, "w", encoding="utf-8") as f:
-                    f.write(content)
-
-        return model_dir
 
 
-def save_metrics_to_database(model_name: str, layer_metrics: dict, database_dir: str):
-    """Saves metrics for each layer to the database."""
+def load_tensors_and_metrics(model_name: str, database_dir: str) -> dict:
+    """Loads tensors and their metrics from the database with new schema."""
     db_path = Path(database_dir) / "models.db"
     with sqlite3.connect(db_path) as conn:
         cursor = conn.cursor()
-        try:
-            model_id = _get_model_id(cursor, model_name)
-            for layer_name, metrics in layer_metrics.items():
-                cursor.execute(
-                    "SELECT layer_id FROM layers WHERE model_id = ? AND layer_name = ?",
-                    (model_id, layer_name),
-                )
-                result = cursor.fetchone()
-                if not result:
-                    print(
-                        f"Warning: Layer {layer_name} not found for model {model_name}"
-                    )
-                    continue
-                layer_id = result[0]
 
-                for metric_name, metric_value in metrics.items():
-                    try:
-                        cursor.execute(
-                            """
-                            INSERT OR REPLACE INTO metrics (
-                                layer_id, metric_name, metric_value, calculation_date
-                            ) VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                        """,
-                            (layer_id, metric_name, float(metric_value)),
-                        )
-                    except Exception as e:
-                        print(
-                            f"Error saving metric {metric_name} for layer {layer_name}: {e}"
-                        )
-        except Exception as e:
-            print(f"Error saving metrics for {model_name} to database: {e}")
-            conn.rollback()
-            raise
-
-
-def get_metrics_from_database(
-    model_name: str, database_dir: str, metric_names: Optional[list[str]] = None
-) -> dict:
-    """Retrieves metrics for a model from the database."""
-    db_path = Path(database_dir) / "models.db"
-    with sqlite3.connect(db_path) as conn:
-        cursor = conn.cursor()
-        model_id = _get_model_id(cursor, model_name)
-
-        query = """
-            SELECT l.layer_name, m.metric_name, m.metric_value, m.calculation_date
-            FROM layers l
-            JOIN metrics m ON l.layer_id = m.layer_id
-            WHERE l.model_id = ?
-        """
-        params = [model_id]
-        if metric_names:
-            query += f" AND m.metric_name IN ({','.join(['?']*len(metric_names))})"
-            params.extend(metric_names)
-
-        cursor.execute(query, params)
-        results = {}
-        for layer_name, metric_name, metric_value, calc_date in cursor.fetchall():
-            results.setdefault(layer_name, {}).update(
-                {metric_name: {"value": metric_value, "calculation_date": calc_date}}
-            )
-
-        return results
-
-
-def download_model(model_name: str, models_dir: str) -> str:
-    """Downloads a model from the Hugging Face Hub."""
-    local_path = Path(models_dir) / model_name.replace("/", "_")
-    if not local_path.exists():
-        print(f"Downloading {model_name} to {local_path}")
-        try:
-            snapshot_download(
-                repo_id=model_name,
-                local_dir=local_path,
-                local_dir_use_symlinks=False,
-                revision="main",
-            )
-        except Exception as e:
-            print(f"Error downloading {model_name}: {e}")
-            raise
-    else:
-        print(f"Model {model_name} already exists at {local_path}")
-    return str(local_path)
-
-
-def load_model(model_path: str) -> AutoModelForCausalLM:
-    """Loads a model from a local path."""
-    try:
-        return AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-            device_map="auto",
+        # First get model_id
+        cursor.execute(
+            "SELECT model_id FROM models WHERE model_name = ?", (model_name,)
         )
-    except Exception as e:
-        print(f"Error loading model from {model_path}: {e}")
-        raise
+        result = cursor.fetchone()
+        if not result:
+            raise ValueError(f"Model {model_name} not found in database")
+
+        model_id = result[0]
+
+        # Get tensors with their metrics using a more efficient query
+        cursor.execute(
+            """
+            SELECT 
+                t.name,
+                t.tensor_data,
+                t.tensor_shape,
+                t.tensor_dtype,
+                GROUP_CONCAT(m.metric_name || ':' || m.metric_value) as metrics
+            FROM tensors t
+            LEFT JOIN tensor_metrics m ON t.tensor_id = m.tensor_id
+            WHERE t.model_id = ?
+            GROUP BY t.tensor_id, t.name
+            """,
+            (model_id,),
+        )
+
+        tensors_and_metrics = {}
+        for name, tensor_data, shape_str, dtype_str, metrics_str in cursor.fetchall():
+            # Reconstruct tensor on CPU
+            shape = json.loads(shape_str)
+            tensor = (
+                torch.frombuffer(
+                    tensor_data, dtype=getattr(torch, dtype_str.split(".")[-1])
+                )
+                .reshape(shape)
+                .clone()
+                .to("cpu")
+            )
+
+            # Parse metrics
+            metrics = {}
+            if metrics_str:
+                for metric_item in metrics_str.split(","):
+                    metric_name, value = metric_item.split(":")
+                    metrics[metric_name] = float(value)
+
+            tensors_and_metrics[name] = {"tensor": tensor, "metrics": metrics}
+
+    return tensors_and_metrics
 
 
-def get_model_layer_metrics(model_name: str, database_dir: str) -> dict:
-    """Gets all metrics for all layers of a specific model."""
-    return get_metrics_from_database(model_name, database_dir)
+def load_model_and_metrics(model_name: str, database_dir: str) -> tuple[dict, dict]:
+    """Convenience function to load both model data and tensors/metrics."""
+    model_data = load_model_data(model_name, database_dir)
+    tensors_data = load_tensors_and_metrics(model_name, database_dir)
+    return model_data, tensors_data
 
 
-def compare_model_metrics(
-    model_names: list[str], database_dir: str, metric_names: Optional[list[str]] = None
-) -> dict:
-    """Compares metrics between multiple models."""
-    return {
-        model_name: get_metrics_from_database(model_name, database_dir, metric_names)
-        for model_name in model_names
-    }
+def _store_tensor(
+    cursor: sqlite3.Cursor,
+    tensor_id: str,
+    model_id: str,
+    name: str,
+    tensor: torch.Tensor,
+) -> None:
+    """Store a single tensor in the database."""
+    cursor.execute(
+        """
+        INSERT INTO tensors (tensor_id, model_id, name, tensor_data, tensor_shape, tensor_dtype)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            tensor_id,
+            model_id,
+            name,
+            tensor.numpy().tobytes(),
+            json.dumps(list(tensor.shape)),
+            str(tensor.dtype),
+        ),
+    )
 
 
-def calculate_metric(
-    layer: torch.Tensor, metric_name: str, all_layers: Optional[list] = None
-) -> float:
+def _calculate_metrics(tensor: torch.Tensor, device: torch.device) -> dict[str, float]:
+    """Calculate all metrics for a tensor."""
+    metrics = {}
+    # Only move tensor to device for metric calculation
+    tensor_device = tensor.to(device)
+
+    # Define all metrics to calculate
+    all_metrics = [
+        "snr",
+        "normalized_effective_rank",
+        "svd_skewness",
+        "bzip2",
+        "kurtosis",
+        "skewness",
+        "sparsity",
+        "spectral_norm",
+        "frobenius_norm",
+        "weight_entropy",
+        "stable_rank",
+    ]
+
+    for metric_name in all_metrics:
+        try:
+            metrics[metric_name] = calculate_metric(tensor_device, metric_name)
+        except Exception as e:
+            logger.error(f"Error calculating {metric_name}: {e}")
+            metrics[metric_name] = float("nan")
+
+    # Move tensor back to CPU after calculations
+    del tensor_device
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    return metrics
+
+
+def _store_metrics(
+    cursor: sqlite3.Cursor, tensor_id: str, metrics: dict[str, float]
+) -> None:
+    """Store calculated metrics for a tensor."""
+    cursor.executemany(
+        """
+        INSERT INTO tensor_metrics (tensor_id, metric_name, metric_value)
+        VALUES (?, ?, ?)
+        """,
+        [(tensor_id, name, value) for name, value in metrics.items()],
+    )
+
+
+def _load_model_configs(model_path: str) -> dict[str, str]:
+    """Load all configuration files from model directory."""
+    model_path = Path(model_path)
+    configs = {}
+
+    config_files = [
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "vocab.json",
+        "generation_config.json",
+        "added_tokens.json",
+    ]
+
+    for filename in config_files:
+        filepath = model_path / filename
+        if filepath.exists():
+            with open(filepath, "r", encoding="utf-8") as f:
+                configs[filename.replace(".json", "_json")] = f.read()
+        else:
+            configs[filename.replace(".json", "_json")] = None
+
+    return configs
+
+
+def calculate_metric(layer: torch.Tensor, metric_name: str) -> float:
     """Calculates a specified metric for a layer."""
     # In-place conversion to float32 for calculations
     layer = layer.float()
@@ -693,13 +352,13 @@ def calculate_metric(
         return _calculate_svd_skewness(layer)
     elif metric_name == "bzip2":
         return _calculate_bzip2(layer)
-    elif metric_name == "weight_kurtosis":
+    elif metric_name == "kurtosis":
         return _calculate_weight_kurtosis(layer)
-    elif metric_name == "weight_skewness":
+    elif metric_name == "skewness":
         return _calculate_weight_skewness(layer)
-    elif metric_name == "weight_sparsity":
+    elif metric_name == "sparsity":
         return _calculate_weight_sparsity(layer)
-    elif metric_name == "weight_spectral_norm":
+    elif metric_name == "spectral_norm":
         return _calculate_weight_spectral_norm(layer)
     elif metric_name == "frobenius_norm":
         return _calculate_frobenius_norm(layer)
@@ -802,29 +461,160 @@ def _normalize_tensor(A: torch.Tensor) -> torch.Tensor:
     """Normalizes tensor magnitude while preserving signs."""
     signs = A.sign()
     A = A.abs()
-    A /= A.max().clamp(min=1e-8)  # In-place division with clamp
+    A /= A.max().clamp(min=1e-8)
     return A * signs
 
 
-def load_config(config_path: str) -> dict:
-    """Loads configuration from a YAML file."""
-    with open(config_path, "r") as file:
-        return yaml.safe_load(file)
+def download_model(model_name: str, models_dir: str) -> str:
+    """Downloads a model from the Hugging Face Hub."""
+    local_path = Path(models_dir) / model_name.replace("/", "_")
+    if not local_path.exists():
+        logger.info(f"Downloading {model_name} to {local_path}")
+        try:
+            snapshot_download(
+                repo_id=model_name,
+                local_dir=local_path,
+                local_dir_use_symlinks=False,
+                revision="main",
+            )
+        except Exception as e:
+            logger.error(f"Error downloading {model_name}: {e}")
+            raise
+    else:
+        logger.info(f"Model {model_name} already exists at {local_path}")
+    return str(local_path)
+
+
+def load_model(model_path: str) -> AutoModelForCausalLM:
+    """Loads a model from a local path to CPU."""
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16,  # You can still load in bfloat16 on CPU
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+            device_map={"": "cpu"},  # Explicitly load to CPU
+        )
+        return model
+    except Exception as e:
+        logger.error(f"Error loading model from {model_path}: {e}")
+        raise
+
+
+def process_and_store_model(
+    model_name: str,
+    model_path: str,
+    database_dir: str,
+    device: torch.device,
+) -> None:
+    """Process and store model data and tensors for Qwen models, calculating metrics on the specified device."""
+    db_path = Path(database_dir) / "models.db"
+    model_id = str(uuid.uuid4())
+    model_configs = _load_model_configs(model_path)
+
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            INSERT INTO models (
+                model_id, model_name, config_json, tokenizer_json,
+                tokenizer_config_json, vocab_json, generation_config_json,
+                added_tokens_json, special_tokens_map_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                model_id,
+                model_name,
+                *[
+                    model_configs.get(k)
+                    for k in [
+                        "config_json",
+                        "tokenizer_json",
+                        "tokenizer_config_json",
+                        "vocab_json",
+                        "generation_config_json",
+                        "added_tokens_json",
+                        "special_tokens_map_json",
+                    ]
+                ],
+            ),
+        )
+
+        # Load model strictly to CPU
+        model = load_model(model_path)
+        if model is None:
+            return
+
+        # config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        # num_layers = config.num_hidden_layers
+
+        # Iterate through Qwen layers and specific parameters
+        qwen_layers = model.transformer.h
+        for layer_idx, layer in enumerate(qwen_layers):
+            logger.info(f"Processing layer {layer_idx}")
+            layer_params = {
+                f"model.layers.{layer_idx}.self_attn.q_proj": layer.attn.q_proj,
+                f"model.layers.{layer_idx}.self_attn.k_proj": layer.attn.k_proj,
+                f"model.layers.{layer_idx}.self_attn.v_proj": layer.attn.v_proj,
+                f"model.layers.{layer_idx}.self_attn.o_proj": layer.attn.o_proj,
+                f"model.layers.{layer_idx}.mlp.gate_proj": layer.mlp.gate_proj,
+                f"model.layers.{layer_idx}.mlp.up_proj": layer.mlp.up_proj,
+                f"model.layers.{layer_idx}.mlp.down_proj": layer.mlp.down_proj,
+                f"model.layers.{layer_idx}.input_layernorm": layer.ln_1,
+                f"model.layers.{layer_idx}.post_attention_layernorm": layer.ln_2,
+            }
+
+            for name, param in layer_params.items():
+                # bias parameters do not have a .weight attribute in qwen,
+                # only process the weight parameters
+                if hasattr(param, "weight") and param.weight is not None:
+                    tensor = param.weight.data.clone().cpu()
+                elif hasattr(param, "bias") and param.bias is not None:
+                    tensor = param.bias.data.clone().cpu()
+                else:
+                    continue
+
+                tensor_id = str(uuid.uuid4())
+                normalized_tensor = _normalize_tensor(tensor)
+                metrics = _calculate_metrics(normalized_tensor, device)
+
+                _store_tensor(cursor, tensor_id, model_id, name, tensor)
+                _store_metrics(cursor, tensor_id, metrics)
+
+        # Handle other parameters outside of the layers
+        other_params = {
+            "model.embed_tokens": model.transformer.wte,
+            "model.norm": model.transformer.ln_f,
+            "lm_head": model.lm_head,
+        }
+
+        for name, param in other_params.items():
+            if hasattr(param, "weight") and param.weight is not None:
+                tensor = param.weight.data.clone().cpu()
+            elif hasattr(param, "bias") and param.bias is not None:
+                tensor = param.bias.data.clone().cpu()
+            else:
+                continue
+
+            tensor_id = str(uuid.uuid4())
+            normalized_tensor = _normalize_tensor(tensor)
+            metrics = _calculate_metrics(normalized_tensor, device)
+
+            _store_tensor(cursor, tensor_id, model_id, name, tensor)
+            _store_metrics(cursor, tensor_id, metrics)
+
+        conn.commit()
 
 
 def ensure_model_files(model_name: str, models_dir: str) -> Optional[str]:
     """Ensures model files exist locally, downloading if necessary."""
     local_path = os.path.join(models_dir, model_name.replace("/", "_"))
     if os.path.exists(local_path):
-        # Check for essential files
-        if all(
-            os.path.exists(os.path.join(local_path, f))
-            for f in ["config.json", "pytorch_model.bin"]
-        ):
+        if all(os.path.exists(os.path.join(local_path, f)) for f in ["config.json"]):
             return local_path
 
-    # Download if not found or incomplete
-    print(f"Downloading or completing download of {model_name} to {local_path}")
+    logger.info(f"Downloading or completing download of {model_name} to {local_path}")
     try:
         snapshot_download(
             repo_id=model_name,
@@ -834,162 +624,45 @@ def ensure_model_files(model_name: str, models_dir: str) -> Optional[str]:
         )
         return local_path
     except Exception as e:
-        print(f"Error downloading {model_name}: {e}")
+        logger.error(f"Error downloading {model_name}: {e}")
         return None
 
 
-def save_model_complete(
-    model: AutoModelForCausalLM, model_name: str, model_path: str, database_dir: str
-):
-    """Saves complete model (artifacts and weights) to the database."""
-    save_model_artifacts(model_path, model_name, database_dir)
-    save_model_to_database(model, model_name, database_dir)
-
-
-def _get_module_by_name(
-    model: torch.nn.Module, module_name: str
-) -> Optional[torch.nn.Module]:
-    """Helper function to get a module by its hierarchical name."""
-    for name, module in model.named_modules():
-        if name == module_name:
-            return module
-    return None
-
-
-def model_exists_in_database(model_name: str, database_dir: str) -> bool:
-    """Checks if a model exists in the database."""
-    db_path = Path(database_dir) / "models.db"
-    with sqlite3.connect(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT COUNT(*) FROM models WHERE model_name = ?", (model_name,)
-        )
-        return cursor.fetchone()[0] > 0
-
-
-def metrics_exist_in_database(model_name: str, database_dir: str) -> bool:
-    """Checks if metrics exist for a model in the database."""
-    db_path = Path(database_dir) / "models.db"
-    with sqlite3.connect(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT COUNT(*) FROM models m
-            JOIN layers l ON m.model_id = l.model_id
-            JOIN metrics mt ON l.layer_id = mt.layer_id
-            WHERE m.model_name = ?
-        """,
-            (model_name,),
-        )
-        return cursor.fetchone()[0] > 0
-
-
-def get_model_metrics(config: dict):
-    """Main function to process models and calculate metrics."""
-    models_dir = config["models_dir"]
-    database_dir = config["database_dir"]
-    os.makedirs(models_dir, exist_ok=True)
-
-    models = [config["base_model"]] + config["fine_tuned_models"]
-    metrics_to_calculate = [
-        metric for metric, enabled in config["metrics"].items() if enabled
-    ]
-
-    for model_name in models:
-        try:
-            local_model_path = ensure_model_files(model_name, models_dir)
-            if not local_model_path:
-                print(f"Failed to get model files for {model_name}")
-                continue
-
-            if model_exists_in_database(model_name, database_dir):
-                print(f"Model {model_name} exists in database")
-                if metrics_exist_in_database(model_name, database_dir):
-                    print(f"Metrics exist for {model_name}. Skipping...")
-                    continue
-                model = load_model_from_database(model_name, database_dir)
-            else:
-                model = load_model(local_model_path)
-                if not model:
-                    print(f"Failed to load model: {model_name}")
-                    continue
-                save_model_complete(model, model_name, local_model_path, database_dir)
-
-            all_layers, layer_names = _collect_and_normalize_weights(model)
-            layer_metrics = _calculate_metrics_for_layers(
-                layer_names, all_layers, metrics_to_calculate
-            )
-            save_metrics_to_database(model_name, layer_metrics, database_dir)
-
-            # Cleanup
-            del model, all_layers
-            torch.cuda.empty_cache()
-
-        except Exception as e:
-            print(f"Error processing model {model_name}: {e}")
-            continue
-
-
-def _collect_and_normalize_weights(
-    model: AutoModelForCausalLM,
-) -> tuple[list[torch.Tensor], list[str]]:
-    """Collects and normalizes all layers from the model."""
-    all_layers = []
-    layer_names = []
-    for name, module in model.named_modules():
-        if hasattr(module, "weight"):
-            layer = module.weight.data
-            if layer.ndim < 2:
-                layer = layer.unsqueeze(0)
-            # Normalize and convert to bfloat16, store in list
-            all_layers.append(_normalize_tensor(layer).to(torch.bfloat16))
-            layer_names.append(name)
-    return all_layers, layer_names
-
-
-def _calculate_metrics_for_layers(
-    layer_names: list[str], all_layers: list[torch.Tensor], metrics: list[str]
-) -> dict:
-    """Calculates metrics for each layer."""
-    layer_metrics = {}
-    for metric in metrics:
-        print(f"Calculating {metric} for all layers")
-        for i, layer in enumerate(all_layers):
-            name = layer_names[i]
-            try:
-                result = calculate_metric(layer, metric)
-                layer_metrics.setdefault(name, {})[metric] = result
-            except Exception as e:
-                print(f"Error calculating {metric} for layer {name}: {e}")
-                layer_metrics.setdefault(name, {})[metric] = float("nan")
-    return layer_metrics
-
-
-def normalize_metrics(metrics: dict) -> dict:
-    """Normalizes each metric to be between 0 and 1."""
-    metric_values = {
-        metric: torch.tensor([layer[metric] for layer in metrics.values()])
-        for metric in next(iter(metrics.values()))
-    }
-    normalized = {
-        metric: (values - values.min()) / (values.max() - values.min()).clamp(min=1e-8)
-        for metric, values in metric_values.items()
-    }
-    return {k: v.tolist() for k, v in normalized.items()}
+def load_config(config_path: str) -> dict:
+    """Loads configuration from a YAML file."""
+    with open(config_path, "r") as file:
+        return yaml.safe_load(file)
 
 
 @torch.inference_mode()
 def main(config_path: str):
     """Main function to run the model analysis process."""
     config = load_config(config_path)
-    init_database(config["database_dir"])
-    get_model_metrics(config)
-    print("Metric calculation completed and saved to database.")
+    database_dir = config["database_dir"]
+    models_dir = config["models_dir"]
+
+    # Determine the device for metric calculations
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Using device: {device} for metric calculations")
+
+    init_database(database_dir)
+
+    os.makedirs(models_dir, exist_ok=True)
+
+    models = [config["base_model"]] + config["fine_tuned_models"]
+    for model_name in models:
+        local_model_path = ensure_model_files(model_name, models_dir)
+        if not local_model_path:
+            logger.error(f"Failed to get model files for {model_name}")
+            continue
+        process_and_store_model(model_name, local_model_path, database_dir, device)
+
+    logger.info("Model processing and metric calculation complete.")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="mastermerge: Advanced model merging and analysis tool"
+        description="Simplified model management and analysis tool"
     )
     parser.add_argument(
         "--config",
