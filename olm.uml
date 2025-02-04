@@ -1,114 +1,110 @@
 @startuml
-skinparam ActivityShape roundBox
-skinparam ActivityBorderThickness 1
-skinparam ArrowThickness 1
-skinparam ActivityDiamondBorderThickness 1
-skinparam ActivityDiamondBackgroundColor white
-skinparam NoteBorderThickness 1
+title Optimal Layer Merging (OLM)
 
+|Configuration|
 start
-:Load Configuration File;
+:Load YAML Config;
 note right
-  - Dataset paths and modes
-  - Model paths
-  - Merge direction
-  - Base model name (optional)
+  Core config params:
+  - models_dir
+  - output_dir
+  - model_pool
+  - datasets
+  - optimization strategies
 endnote
 
-:Load Datasets;
+|Model Preparation|
+:Download Required Models;
 note right
-  For each dataset:
-  - exact/bigram/quality mode
-  - data format
-  - sample limit
+  Batch download all models
+  from Hugging Face
 endnote
 
-if (Base Model Specified?) then (no)
-  :Auto-Select Base Model;
-  note right
-    Evaluate each model across
-    all datasets to find best
-    initial performer
-  endnote
-endif
-
-:Load Base Model and Tokenizer;
-:Preserve Tokenizer Configuration;
+:Select/Validate Base Model;
 note right
-  Copy critical files:
-  - tokenizer_config.json
-  - tokenizer.json 
-  - vocab.json
-  - merges.txt
-  - special_tokens_map.json
+  Either:
+  - Use provided base model
+  - Dynamically select via 
+    performance ranking
 endnote
 
-:Determine Layer Processing Order;
+|Base Model Setup|
+:Load Base Model;
 note right
-  Direction options:
-  - Forward (0 → N)
-  - Backward (N → 0)
+  CPU-based loading
+  bfloat16 precision
 endnote
 
-while (More Layers?) is (yes)
-  :Process Next Layer;
-  note right: Layer idx in sequence
-  
-  repeat
-    :Load Candidate Model;
-    :Extract Layer;
-    :Replace Layer in Working Model;
-    
-    partition "Dataset Evaluation" {
-      repeat
-        if (Evaluation Mode?) then (exact)
-          :Compute Exact Perplexity;
-          note right
-            1. Process context
-            2. Evaluate response
-            3. Calculate token-level loss
-          endnote
-        elseif (bigram) then
-          :Compute Bigram Perplexity;
-          note right
-            1. Process context + response
-            2. Calculate bigram transitions
-            3. Combine losses
-          endnote
-        else (quality)
-          :Analyze Response Quality;
-          note right
-            1. Generate response
-            2. Check word diversity
-            3. Detect Chinese chars
-            4. Score length/uniqueness
-          endnote
-        endif
-        :Store Dataset Results;
-      repeat while (More Datasets?) is (yes)
-    }
-    
-    :Compute Average Ranks;
+:Compute Base Metrics;
+note right
+  Baseline performance
+  across all datasets
+endnote
+
+|Optimization Phases|
+partition "Boundary Layer Optimization" {
+  if (boundary_select enabled?) then (yes)
+    :Optimize Boundary Components;
     note right
-      Rank performance across
-      datasets to normalize
-      different metric scales
+      Swap embedding, norm, 
+      and language model head
     endnote
-    
-  repeat while (More Models?) is (yes)
-  
-  :Select Best Performing Layer;
-  :Update Working Model;
-  :Save Layer State;
-  note right
-    Update merge_report.json:
-    - Layer metrics
-    - Source model
-    - Dataset performances
-  endnote
-  
-endwhile (no)
+  endif
+}
 
+partition "Layer-wise Optimization" {
+  if (layer_swap enabled?) then (yes)
+    :Iterate Layers;
+    note right
+      Forward or backward 
+      based on config
+    endnote
+
+    while (Layers Remaining) is (yes)
+      :Test Layer Candidates;
+      note right
+        - Swap candidate layer
+        - Evaluate performance
+        - Compute cross-dataset ranks
+      endnote
+
+      :Select Best Performing Layer;
+      note right
+        Lowest average rank 
+        across metrics
+      endnote
+
+      :Update Working Model;
+      :Checkpoint Intermediate State;
+    endwhile
+  endif
+}
+
+partition "Tensor-wise Optimization" {
+  if (tensor_swap enabled?) then (yes)
+    :Iterate Tensors;
+    note right
+      Focus on weight tensors
+    endnote
+
+    while (Tensors Remaining) is (yes)
+      :Test Tensor Candidates;
+      note right
+        - Swap candidate tensor
+        - Evaluate performance
+        - Compute cross-dataset ranks
+      endnote
+
+      :Select Best Performing Tensor;
+      :Update Working Model;
+      :Checkpoint Intermediate State;
+    endwhile
+  endif
+}
+
+|Finalization|
 :Save Final Merged Model;
+:Generate Comprehensive Merge Report;
 stop
-@startuml
+
+@enduml
