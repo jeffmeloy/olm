@@ -1,17 +1,18 @@
 direction: "forward"  # "backward" or "forward"
-models_dir: "./input_models/"
-output_dir: "./merged_model/"
+models_dir: "E:/input_models/"
+output_dir: "D:/merged_model/"
 metric_dir: "./metrics/"
 dataset_dir: "./benchmarks/"
 db_dir:  # either blank or a directory path to store and retreive from a sqlite db
 skip_quality: false
 layer_swap: false
 tensor_swap: true
+skip_norm: false
 base_select: "bigram" # "quality" "bigram", "exact"
 boundary_select:  # "quality", "bigram", "exact", or model name, or none
-improve_all: "base" # "quality" "bigram", "exact", "all", "base", or blank
+improve_all:  # "quality" "bigram", "exact", "all", "base", or blank
 samples: 200 # (tbd) implement code to process this for number of dataset samples to evaluate 
-base_model_name: "newsbang/Homer-v0.5-Qwen2.5-7B"
+base_model_name: "jeffmeloy/Qwen2.5-7B-olm-v1.1"
 models_db: # if blank use only file system files. if true then use sqlite db to store composite model layer composition info and corresponding dataset metrics
 
 models: # uncomment the models you want to merge
@@ -22,9 +23,13 @@ models: # uncomment the models you want to merge
 - "AmberYifan/Qwen2.5-7B-dpo-2k"
 - "AmberYifan/Qwen2.5-7B-dpo-2k-hhrlhf"
 - "Aashraf995/Qwen-Evo-7B"
+- "Azure99/Blossom-V6-7B"
+- "Ba2han/Qwen-2.5-7B-Woonderer-0.1"
 - "beomi/Qwen2.5-7B-Instruct-kowiki-qa"
+- "bespokelabs/Bespoke-Stratos-7B"
 - "brahmairesearch/x1-7B-v0.1"
 - "bugatt/BGLLM"
+- "Bui1dMySea/LongRAG-Qwen2.5-7B-Instruct"
 - "bunnycore/Qandora-2.5-7B"
 - "cooperleong00/Qwen2.5-7B-Instruct-Jailbroken"
 - "DeepGlint-AI/llava-mlcd-qwen2.5-7b"
@@ -41,16 +46,19 @@ models: # uncomment the models you want to merge
 - "hotmailuser/QwenSlerp-7B"
 - "huihui-ai/Qwen2.5-7B-Instruct-abliterated-v2"
 - "HumanLLMs/Human-Like-Qwen2.5-7B-Instruct"
+- "internlm/OREAL-7B-SFT"
 - "internlm/SWE-Fixer-Retriever-7B"
 - "jbjeong91/Qwen2.5_7B_IST_StoryGen_test2"
 - "katanemo/Arch-Function-7B"
 - "Manual-Dataset-Creation-Project/Take-7B"
 - "Manual-Dataset-Creation-Project/Matsu-7B"
 - "Marsouuu/lareneg3Bv2-ECE-PRYMMAL-Martial"
+- "mlfoundations-dev/Bespoke-Stratos-17k-v3"
 - "mlfoundations-dev/hp_ablations_qwen_epoch2"
 - "neopolita/jessi-v0.1-qwen2.5-7b-instruct"
 - "newsbang/Homer-v0.5-Qwen2.5-7B"
 - "nextvalueup/Qwen2.5-7B-Instruct_v3"
+- "nguyentd/FinancialAdvice-Qwen2.5-7B"
 - "nhyha/merge_Qwen2.5-7B-Instruct_20241023_0314"
 - "opencompass/CompassJudger-1-7B-Instruct"
 - "Orion-zhen/Meissa-Qwen2.5-7B-Instruct"
@@ -80,13 +88,11 @@ models: # uncomment the models you want to merge
 - "tugstugi/Qwen2.5-7B-Instruct-QwQ-v0.1"
 - "win10/Verdandi-Qwen2.5-7B"
 - "winstcha/rewrite-7B-INT4"
+- "Xiaojian9992024/Qwen2.5-THREADRIPPER-Small"
+- "xwen-team/Xwen-7B-Chat"
 - "yellowtown/7B-v0.2"
 - "ZeroXClem/Qwen2.5-7B-HomerAnvita-NerdMix"
 - "ZeroXClem/Qwen2.5-7B-HomerCreative-Mix"
-- "Bui1dMySea/LongRAG-Qwen2.5-7B-Instruct"
-- "Ba2han/Qwen-2.5-7B-Woonderer-0.1"
-- "bespokelabs/Bespoke-Stratos-7B"
-- "mlfoundations-dev/Bespoke-Stratos-17k-v3"
 
 #- "bytedance-research/Valley-Eagle-7B"
 #- "Cran-May/T.E-8.1"
@@ -117,7 +123,7 @@ dataset:
   "bbh_sharegpt.json":
     mode: "exact"
   "qpqa_sharegpt.json":
-    mode: "exact"
+    mode: "bigram"
   "math_lvl5_sharegpt.json":
     mode: "exact"
   "mmlupro_sharegpt.json":
@@ -125,8 +131,8 @@ dataset:
   "musr_sharegpt.json":
     mode: "exact"
   "truthfulqa_sharegpt.json":
-    mode: "exact"
+   mode: "exact"
   "arc_sharegpt.json":
     mode: "exact"
-  "longresponse_sharegpt.json":
-    mode: "quality"
+#  "longresponse_sharegpt.json":
+#    mode: "quality"

@@ -611,6 +611,34 @@ def select_best_model(model_ranks: Dict[str, List[int]]) -> str:
 # --- Base Model Handling and Initialization ---
 
 
+def _evaluate_model_candidates(
+    models: List[str],
+    models_dir: str,
+    datasets: Dict,
+    eval_func,
+    *args,
+    **kwargs,
+) -> Dict:
+    """Helper function to evaluate multiple model candidates."""
+    layer_metrics = {dataset_name: {} for dataset_name in datasets}
+    for model_name in models:
+        logger.info(f"Evaluating candidate: {model_name}")
+        try:
+            model, tokenizer = load_model(
+                Path(models_dir) / model_name.replace("/", "_"), "cpu"
+            )
+            for dataset_name, dataset in datasets.items():
+                metric = eval_func(model, tokenizer, dataset, *args, **kwargs)
+                layer_metrics[dataset_name][model_name] = metric
+                logger.info(f"{model_name}: {dataset_name}: {metric}")
+            del model
+        except Exception as e:
+            logger.error(f"Error evaluating {model_name}: {e}")
+            continue
+
+    return layer_metrics
+
+
 def select_base_model(
     models_dir: str, models: List[str], datasets: Dict, selected_metric: str
 ) -> str:
@@ -620,23 +648,15 @@ def select_base_model(
         for name, dataset in datasets.items()
         if dataset["mode"] == selected_metric
     }
-    layer_metrics = {dataset_name: {} for dataset_name in selected_datasets}
-    for model_name in models:
-        logger.info(f"Evaluating base candidate: {model_name}")
-        try:
-            model, tokenizer = load_model(
-                Path(models_dir) / model_name.replace("/", "_"), "cpu"
-            )
-            for dataset_name, dataset in selected_datasets.items():
-                metric = evaluate_model_on_dataset(
-                    model, tokenizer, dataset["data"], dataset["mode"]
-                )
-                layer_metrics[dataset_name][model_name] = metric
-                logger.info(f"{model_name}: {dataset_name}: {metric}")
-            del model
-        except Exception as e:
-            logger.error(f"Error evaluating {model_name}: {e}")
-            continue
+
+    def eval_func(model, tokenizer, dataset):
+        return evaluate_model_on_dataset(
+            model, tokenizer, dataset["data"], dataset["mode"]
+        )
+
+    layer_metrics = _evaluate_model_candidates(
+        models, models_dir, selected_datasets, eval_func
+    )
 
     valid_models = set(models)
     model_ranks = {
@@ -694,7 +714,7 @@ def get_base_metrics(
     logger.info(f"Base metrics saved to {report_path}")
 
 
-# --- Layer Processing and Degradation Handling ---
+# --- Processing and Degradation Handling ---
 
 
 def process_model(
@@ -729,14 +749,18 @@ def process_model(
             for name, metrics in layer_metrics.items()
             if datasets[name]["mode"] != "quality"
         }
+
+    def eval_func(model, tokenizer, dataset):
+        return evaluate_model_on_dataset(
+            model, tokenizer, dataset["data"], dataset["mode"], samples
+        )
+
     for dataset_name, dataset in datasets.items():
         if dataset_name not in layer_metrics:
             layer_metrics[dataset_name] = {}
 
         try:
-            metric = evaluate_model_on_dataset(
-                working_model, tokenizer, dataset["data"], dataset["mode"], samples
-            )
+            metric = eval_func(working_model, tokenizer, dataset)
         except Exception as e:
             logger.error(f"Error evaluating {model_name} on {dataset_name}: {e}")
             metric = float("inf")
@@ -769,6 +793,17 @@ def process_model(
 # --- Boundary Layer Optimization ---
 
 
+def _apply_boundary_components(
+    working_model: AutoModelForCausalLM, source_model: AutoModelForCausalLM
+) -> None:
+    """Helper Function to apply boundary components to the working model"""
+    working_model.model.embed_tokens.load_state_dict(
+        source_model.model.embed_tokens.state_dict()
+    )
+    working_model.model.norm.load_state_dict(source_model.model.norm.state_dict())
+    working_model.lm_head.load_state_dict(source_model.lm_head.state_dict())
+
+
 def get_boundary_layers(
     working_model: AutoModelForCausalLM,
     config: Dict,
@@ -795,23 +830,22 @@ def get_boundary_layers(
         "lm_head": working_model.lm_head.state_dict(),
     }
 
+    def eval_func(model, tokenizer, dataset):
+        return evaluate_model_on_dataset(
+            model, tokenizer, dataset["data"], dataset["mode"]
+        )
+
     for model_name in config["models"]:
         try:
             source, _ = load_model(
                 f"{models_dir}/{model_name.replace('/', '_')}", "cpu"
             )
 
-            working_model.model.embed_tokens.load_state_dict(
-                source.model.embed_tokens.state_dict()
-            )
-            working_model.model.norm.load_state_dict(source.model.norm.state_dict())
-            working_model.lm_head.load_state_dict(source.lm_head.state_dict())
+            _apply_boundary_components(working_model, source)
 
             for dataset_name, dataset in datasets.items():
                 if dataset["mode"] == boundary_metric:
-                    metric = evaluate_model_on_dataset(
-                        working_model, tokenizer, dataset["data"], dataset["mode"]
-                    )
+                    metric = eval_func(working_model, tokenizer, dataset)
                     component_metrics[dataset_name][model_name] = metric
                     logger.info(f"{model_name}: {dataset_name}: {metric}")
                 else:
@@ -848,11 +882,7 @@ def get_boundary_layers(
 
         source, _ = load_model(f"{models_dir}/{best_model.replace('/', '_')}", "cpu")
 
-        working_model.model.embed_tokens.load_state_dict(
-            source.model.embed_tokens.state_dict()
-        )
-        working_model.model.norm.load_state_dict(source.model.norm.state_dict())
-        working_model.lm_head.load_state_dict(source.lm_head.state_dict())
+        _apply_boundary_components(working_model, source)
 
         logger.info(f"Applied boundary components from {best_model}")
 
@@ -1006,14 +1036,25 @@ def tensor_wise_optimization(
     merge_report: Dict,
 ) -> AutoModelForCausalLM:
     """Tensor optimization: Computational natural selection, one tensor at a time."""
+
     tensor_map = {
         name: param
         for name, param in working_model.named_parameters()
-        if "weight" in name  # That's all we need, fam
+        if "weight" in name
     }
-    logger.info(f"Found {len(tensor_map)} tensors ready for optimization")
 
+    # Reverse the tensor_map for the backward direction
+    direction = config.get("direction", "forward")
+    if direction == "backward":
+        tensor_map = dict(reversed(list(tensor_map.items())))
+
+    skip_norm = config.get("skip_norm", False)
     for tensor_name, tensor in tensor_map.items():
+        # keep base norm tensors speed up the process
+        if "norm" in tensor_name and skip_norm:
+            logger.info(f"Keeping base model normalization tensor: {tensor_name}")
+            continue
+
         logger.info(f"\nOptimizing tensor: {tensor_name}")
         layer_metrics = {dataset_name: {} for dataset_name in datasets}
         original_weights = tensor.data.clone()
@@ -1170,6 +1211,12 @@ def olm(config: Dict, merge_report: str) -> str:
             output_dir=output_dir,
             base_metrics=base_metrics,
             merge_report=merge_report,
+        )
+
+    if boundary_select:
+        logger.info("Optimizing boundary layers...")
+        merge_report, working_model = get_boundary_layers(
+            working_model, config, datasets, tokenizer
         )
 
     db_dir = config.get("db_dir", None)
