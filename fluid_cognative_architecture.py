@@ -19,9 +19,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from collections import Counter
 from dataclasses import dataclass
-from scipy.stats import rankdata
 import math
 from collections import deque, defaultdict
+from torch.utils.data import Dataset
 
 """
 Classes:
@@ -1699,18 +1699,23 @@ class MetricBootstrapper:
 
 @dataclass
 class FluidCache:
-    """Cache for fluid dynamics calculations"""
+    """Cache for fluid dynamics calculations with precalculated common values"""
 
     tensor: Tensor
     flat: Tensor
     shape: torch.Size
-    gradients: list[Tensor]  # Spatial gradients
-    density: Tensor  # Normalized density field
-    velocity: Tensor  # Flow velocity field
-    energy: Tensor  # Local energy density
-    numel: int  # Number of elements
+    numel: int
     mean: float
     std: float
+    gradients: List[Tensor]
+    density: Tensor
+    velocity: Tensor
+    energy: Tensor
+    strain: Tensor = None
+    viscosity: float = None
+    stability: float = None
+    gradient_magnitude: float = None
+    characteristic_length: float = None
 
 
 class FluidAnalyzer:
@@ -1738,28 +1743,51 @@ class FluidAnalyzer:
         }
 
     def _build_cache(self, tensor: Tensor) -> FluidCache:
-        """Build cached fluid properties for efficient computation"""
+        """Build optimized cache with precalculated values for fluid analysis"""
         tensor = tensor.to(self.device)
         flat = tensor.flatten()
+        shape = tensor.shape
+        mean_val = flat.mean().item()
+        std_val = flat.std().item()
         signs = tensor.sign()
         density = tensor.abs()
-        density.div_(density.max().clamp(min=1e-8))
+        max_val = density.max().clamp(min=1e-8)
+        density.div_(max_val)
         density.mul_(signs)
         gradients = torch.gradient(density)
         velocity = torch.stack(gradients).mean(0)
         energy = 0.5 * (density.pow(2) + velocity.pow(2))
+        strain = torch.stack([g.abs() for g in gradients]).mean(0)
+        viscosity_val = float(1.0 / (1.0 + strain.mean()))
+        velocity_mag = velocity.abs()
+        vel_mean = velocity_mag.mean()
+        epsilon = max(1e-8, tensor.abs().max() * 1e-5)
+        stability_val = float(1.0 / (1.0 + velocity_mag.std() / (vel_mean + epsilon)))
+        grad_mag = sum(g.pow(2).mean() for g in gradients)
+        grad_mag_val = float(grad_mag.sqrt())
+        if len(shape) > 1:
+            characteristic_length = torch.prod(
+                torch.tensor(shape, dtype=torch.float32)
+            ) ** (1.0 / len(shape))
+        else:
+            characteristic_length = float(shape[0])
 
         return FluidCache(
             tensor=tensor,
             flat=flat,
-            shape=tensor.shape,
+            shape=shape,
+            numel=flat.numel(),
+            mean=mean_val,
+            std=std_val,
             gradients=gradients,
             density=density,
             velocity=velocity,
             energy=energy,
-            numel=flat.numel(),
-            mean=flat.mean().item(),
-            std=flat.std().item(),
+            strain=strain,
+            viscosity=viscosity_val,
+            stability=stability_val,
+            gradient_magnitude=grad_mag_val,
+            characteristic_length=characteristic_length,
         )
 
     @torch.no_grad()
@@ -1767,7 +1795,6 @@ class FluidAnalyzer:
         self, tensor: Tensor, prev_tensor: Optional[Tensor] = None
     ) -> Dict[str, float]:
         """Analyze tensor as fluid system with optional temporal comparison"""
-
         self.prev_cache = self.current_cache
         self.current_cache = self._build_cache(tensor)
         if prev_tensor is not None:
@@ -1776,7 +1803,17 @@ class FluidAnalyzer:
         results = {}
         for name, func in self.metrics.items():
             try:
-                results[name] = float(func())
+                if name == "viscosity" and self.current_cache.viscosity is not None:
+                    results[name] = self.current_cache.viscosity
+                elif name == "stability" and self.current_cache.stability is not None:
+                    results[name] = self.current_cache.stability
+                elif (
+                    name == "surface_tension"
+                    and self.current_cache.gradient_magnitude is not None
+                ):
+                    results[name] = self.current_cache.gradient_magnitude
+                else:
+                    results[name] = float(func())
             except Exception as e:
                 results[name] = float("nan")
                 logger.error(f"Error calculating metric {name}: {e}")
@@ -1786,211 +1823,147 @@ class FluidAnalyzer:
 
         return results
 
-    def _calc_viscosity(self) -> Tensor:
-        """Calculate effective viscosity using strain rate"""
+    def _calc_viscosity(self) -> float:
+        """Calculate effective viscosity using strain rate (use cached value if available)"""
+        if self.current_cache.viscosity is not None:
+            return self.current_cache.viscosity
         cache = self.current_cache
-        strain = torch.stack([g.abs() for g in cache.gradients]).mean(0)
-        return 1.0 / (1.0 + strain.mean())
+        return float(1.0 / (1.0 + cache.strain.mean()))
 
-    def _calc_surface_tension(self) -> Tensor:
-        """Surface tension from density gradients"""
+    def _calc_surface_tension(self) -> float:
+        """Surface tension from density gradients (use cached value if available)"""
+        if self.current_cache.gradient_magnitude is not None:
+            return self.current_cache.gradient_magnitude
         cache = self.current_cache
         grad_mag = sum(g.pow(2).mean() for g in cache.gradients)
-        return grad_mag.sqrt()
+        return float(grad_mag.sqrt())
 
-    def _calc_vorticity(self) -> Tensor:
-        """Calculate vorticity efficiently for available dimensions"""
+    def _calc_vorticity(self) -> float:
+        """Calculate vorticity with proper curl approximation when possible"""
         cache = self.current_cache
-        if len(cache.shape) < 2:
-            return torch.tensor(0.0, device=self.device)
+        shape = cache.shape
+        if len(shape) < 2:
+            return 0.0
+        if len(shape) == 2 and len(cache.gradients) == 2:
+            try:
+                curl = cache.gradients[1].mean(dim=1) - cache.gradients[0].mean(dim=0)
+                return float(curl.abs().mean())
+            except Exception:
+                pass
 
-        vorticity = torch.tensor(0.0, device=self.device)
+        vorticity = 0.0
         for i, gi in enumerate(cache.gradients[:-1]):
             for gj in cache.gradients[i + 1 :]:
-                vorticity.add_((gi - gj).abs().mean())
+                vorticity += float((gi - gj).abs().mean())
+
         return vorticity
 
-    def _calc_turbulence(self) -> Tensor:
-        """Turbulence from velocity fluctuations"""
+    def _calc_turbulence(self) -> float:
+        """Turbulence from velocity fluctuations with improved epsilon"""
         cache = self.current_cache
-        return cache.velocity.std() / (cache.velocity.abs().mean() + 1e-8)
+        epsilon = max(1e-8, cache.tensor.abs().max() * 1e-5)
+        return float(cache.velocity.std() / (cache.velocity.abs().mean() + epsilon))
 
-    def _calc_flow_coherence(self) -> Tensor:
-        """Spatial coherence through autocorrelation"""
+    def _calc_flow_coherence(self) -> float:
+        """Spatial coherence through autocorrelation with downsampling for large tensors"""
         cache = self.current_cache
-        fft = torch.fft.rfft(cache.density.flatten())
-        power = torch.abs(fft).pow_(2)
+        flat_density = cache.density.flatten()
+        if flat_density.numel() > 10000:
+            stride = max(1, flat_density.numel() // 10000)
+            flat_density = flat_density[::stride]
+        fft = torch.fft.rfft(flat_density)
+        power = torch.abs(fft).pow(2)
         corr = torch.fft.irfft(power)
-        return corr[0] / (corr.max() + 1e-8)
+        epsilon = max(1e-8, corr.abs().max() * 1e-5)
+        return float(corr[0] / (corr.max() + epsilon))
 
-    def _calc_phase_coherence(self) -> Tensor:
-        """Phase coherence across field"""
+    def _calc_phase_coherence(self) -> float:
+        """Phase coherence across field with multi-scale analysis"""
         cache = self.current_cache
-        angles = torch.angle(cache.density[1:] + 1j * cache.density[:-1])
-        return torch.abs(torch.exp(1j * angles).mean())
+        flat = cache.density.flatten()
+        angles_short = torch.angle(flat[1:] + 1j * flat[:-1])
+        coherence_short = torch.abs(torch.exp(1j * angles_short).mean())
 
-    def _calc_stability(self) -> Tensor:
-        """Stability from spectral properties"""
-        cache = self.current_cache
+        if len(flat) > 100:
+            stride = max(5, len(flat) // 50)
+            angles_medium = torch.angle(flat[stride:] + 1j * flat[:-stride])
+            coherence_medium = torch.abs(torch.exp(1j * angles_medium).mean())
+            return float(0.7 * coherence_short + 0.3 * coherence_medium)
+
+        return float(coherence_short)
+
+    def _calc_stability(self, cache=None) -> float:
+        """Stability from spectral properties (use cached value if available)"""
+        if cache is None:
+            cache = self.current_cache
+            if cache.stability is not None:
+                return cache.stability
+
         velocity_mag = cache.velocity.abs()
-        return 1.0 / (1.0 + velocity_mag.std() / (velocity_mag.mean() + 1e-8))
+        epsilon = max(1e-8, cache.tensor.abs().max() * 1e-5)
+        return float(1.0 / (1.0 + velocity_mag.std() / (velocity_mag.mean() + epsilon)))
 
-    def _calc_energy_density(self) -> Tensor:
+    def _calc_energy_density(self) -> float:
         """Total energy density"""
-        return self.current_cache.energy.mean()
+        return float(self.current_cache.energy.mean())
 
-    def _calc_pressure_gradient(self) -> Tensor:
+    def _calc_pressure_gradient(self) -> float:
         """Pressure gradient using density gradient"""
         cache = self.current_cache
-        return 2.0 * (cache.density * torch.stack(cache.gradients)).abs().mean()
+        return float(2.0 * (cache.density * torch.stack(cache.gradients)).abs().mean())
 
-    def _calc_reynolds(self) -> Tensor:
-        """Reynolds number analog"""
+    def _calc_reynolds(self) -> float:
+        """Reynolds number analog using geometric mean characteristic length"""
         cache = self.current_cache
-        characteristic_length = max(cache.shape)
         return (
-            cache.velocity.abs().mean() * characteristic_length
-        ) / self._calc_viscosity()
+            float(cache.velocity.abs().mean() * cache.characteristic_length)
+            / self._calc_viscosity()
+        )
 
     def _calc_temporal_metrics(self) -> Dict[str, float]:
         """Calculate metrics between current and previous state"""
         curr, prev = self.current_cache, self.prev_cache
+        if curr is None or prev is None:
+            return {}
+        current_stability = self._calc_stability(curr)
+        prev_stability = self._calc_stability(prev)
         return {
             "information_flux": float((curr.density - prev.density).abs().mean()),
-            "stability_trend": float(self._calc_stability() - self._calc_stability()),
+            "stability_trend": float(current_stability - prev_stability),
             "energy_transfer": float((curr.energy - prev.energy).mean()),
+            "velocity_change": float((curr.velocity - prev.velocity).abs().mean()),
+            "pattern_persistence": float(
+                torch.cosine_similarity(
+                    curr.density.flatten(), prev.density.flatten(), dim=0
+                )
+            ),
         }
 
+    def compute_flow(self, tensor: Tensor, steps: int = 1) -> Tensor:
+        """Compute natural flow field for tensor evolution"""
+        self.analyze(tensor)
+        cache = self.current_cache
+        flow = torch.zeros_like(tensor)
+        energy_grads = torch.gradient(cache.energy)
+        for i, grad in enumerate(energy_grads):
+            slices = [slice(None)] * len(cache.shape)
+            slices[i] = slice(None)
+            flow[tuple(slices)] -= grad * (1.0 - cache.viscosity)
 
-class Evolution(nn.Module):
-    """Universal evolution of tensor fields toward natural states"""
-
-    def __init__(self, analyzer: FluidAnalyzer):
-        super().__init__()
-        self.analyzer = analyzer
-        self.flow_memory = deque(maxlen=100)
-        self.metric_history = deque(maxlen=50)
-
-    def evolve(self, tensor: torch.Tensor, steps: int = 100) -> torch.Tensor:
-        """Let tensor evolve naturally toward optimal state"""
-        current = tensor.clone()
-        best_state = tensor.clone()
-        best_energy = float("-inf")
-
-        for step in range(steps):
-            # Calculate field metrics
-            metrics = {
-                name: func(current) for name, func in self.analyzer.metrics.items()
-            }
-            self.metric_history.append(metrics)
-
-            # Compute flow dynamics
-            flow = self._compute_flow(current, metrics)
-            self.flow_memory.append(flow)
-
-            # Update using fluid dynamics
-            stability = self._estimate_stability()
-            current = current + stability * flow
-            current = current / current.norm()
-
-            # Track best state using energy
-            energy = self._compute_energy(metrics)
-            if energy > best_energy:
-                best_energy = energy
-                best_state = current.clone()
-
-        return best_state
-
-    def _compute_flow(
-        self, tensor: torch.Tensor, metrics: Dict[str, float]
-    ) -> torch.Tensor:
-        """Compute natural flow field"""
-        # Get flow direction from recent history
-        if len(self.flow_memory) > 0:
-            momentum = sum(self.flow_memory) / len(self.flow_memory)
-        else:
-            momentum = torch.zeros_like(tensor)
-
-        # Add turbulent fluctuations based on stability
-        turbulence = metrics["turbulence"] * torch.randn_like(tensor)
-
-        # Combine smooth and turbulent flow
-        flow = 0.9 * momentum + 0.1 * turbulence
-        return flow * metrics["fluid_stability"]
-
-    def _estimate_stability(self) -> float:
-        """Estimate system stability for flow control"""
-        if len(self.metric_history) < 2:
-            return 1.0
-
-        recent = np.array(
-            [[m[k] for k in self.analyzer.metrics.keys()] for m in self.metric_history]
-        )
-
-        # More stable when metrics are consistent
-        stability = np.exp(-np.std(recent, axis=0).mean())
-        return float(np.clip(stability, 0.1, 2.0))
-
-    def _compute_energy(self, metrics: Dict[str, float]) -> float:
-        """Compute total field energy"""
-        return (
-            metrics["phase_coherence"]
-            * metrics["fluid_stability"]
-            * (1.0 - metrics["turbulence"])
-        )
-
-
-class UniversalCompression:
-    """Compress any complex system into pure signals"""
-
-    def __init__(self, physics: Optional[Dict] = None):
-        self.analyzer = FluidAnalyzer()
-        self.evolution = Evolution(self.analyzer)
-        self.physics = physics or {}
-
-    def compress(
-        self, data: torch.Tensor, signal_threshold: float = 0.7
-    ) -> torch.Tensor:
-        """Compress complexity into clean signals"""
-        # Extract natural flow field
-        flow = self._extract_flow(data)
-
-        # Let system evolve naturally
-        evolved = self.evolution.evolve(flow)
-
-        # Project onto signal manifold
-        signals = self._extract_signals(evolved, signal_threshold)
-
-        return signals
-
-    def _extract_flow(self, data: torch.Tensor) -> torch.Tensor:
-        """Convert data into natural flow field"""
-        if len(data.shape) < 2:
-            data = data.unsqueeze(-1)
-
-        # Apply domain physics if specified
-        if self.physics:
-            flow = self.physics["flow_func"](data)
-        else:
-            # Default to gradient flow
-            flow = torch.autograd.grad(data.sum(), data, create_graph=True)[0]
-
+        if len(cache.shape) >= 2:
+            for i, gi in enumerate(cache.gradients[:-1]):
+                for j, gj in enumerate(cache.gradients[i + 1 :], i + 1):
+                    rotational = gi - gj
+                    slices_i = [slice(None)] * len(cache.shape)
+                    slices_i[j] = slice(None)
+                    flow[tuple(slices_i)] += rotational * 0.2
+                    slices_j = [slice(None)] * len(cache.shape)
+                    slices_j[i] = slice(None)
+                    flow[tuple(slices_j)] -= rotational * 0.2
+        flow_norm = flow.norm()
+        if flow_norm > 0:
+            flow = flow / flow_norm
         return flow
-
-    def _extract_signals(self, tensor: torch.Tensor, threshold: float) -> torch.Tensor:
-        """Project evolved state onto signal manifold"""
-        # Get dominant components
-        U, S, V = torch.linalg.svd(tensor)
-        signal_strength = S[0] / S.sum()
-
-        # Threshold into clean signals
-        signals = torch.where(
-            signal_strength > threshold,
-            1.0,
-            torch.where(signal_strength < -threshold, -1.0, 0.0),
-        )
-
-        return signals
 
 
 class XLSTMCell(nn.Module):
@@ -2035,6 +2008,475 @@ class LIONOptimizer:
         for param in self.params:
             if param.grad is not None:
                 param.grad.zero_()
+
+
+class FluidXLSTM(nn.Module):
+    """Unified controller integrating fluid dynamics, XLSTM guidance, and HDC conceptual reasoning"""
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int = 128,
+        hdc_dimension: int = 10000,
+        sequence_length: int = 1,
+        learning_rate: float = 1e-3,
+        device: str = "cuda",
+    ):
+        super().__init__()
+        self.device = torch.device(device)
+        self.xlstm = XLSTM(input_size, hidden_size, sequence_length, learning_rate).to(
+            self.device
+        )
+        self.fluid = FluidAnalyzer(self.device)
+        self.hdc = HyperdimensionalEncoder(dimension=hdc_dimension)
+
+        # Conceptual memory system
+        self.tensor_concepts = {}  # tensor_name -> HDC vector
+        self.flow_memory = {}  # tensor_name -> list of historical flow fields
+        self.perf_memory = {}  # tensor_name -> list of historical performance deltas
+
+        # Projection matrices for HDC -> tensor space mapping
+        self._projection_matrices = {}  # shape_key -> projection matrix
+
+        # Adaptive blending network
+        self.blend_network = nn.Sequential(
+            nn.Linear(input_size + 1, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, 3),  # 3 weights for blending
+        ).to(self.device)
+        self.blend_optimizer = LIONOptimizer(
+            self.blend_network.parameters(), lr=learning_rate
+        )
+
+    def forward(
+        self,
+        tensor_name: str,
+        tensor_metrics: torch.Tensor,
+        tensor_data: torch.Tensor,
+        hdc_direction: Optional[torch.Tensor] = None,
+    ):
+        """
+        Unified forward pass integrating all guidance systems:
+        1. XLSTM predicts performance impact and direction
+        2. Fluid analyzer computes natural flow fields
+        3. HDC concepts provide semantic guidance
+        """
+        # Ensure metrics are properly shaped
+        if tensor_metrics.dim() == 1:
+            tensor_metrics = tensor_metrics.unsqueeze(0).unsqueeze(0)
+
+        # Get XLSTM guidance
+        xlstm_output, _ = self.xlstm(tensor_metrics)
+        xlstm_guidance = xlstm_output.squeeze().item()  # Scalar guidance value
+
+        # Calculate natural fluid dynamics flow field
+        fluid_field = self.fluid.compute_flow(tensor_data)
+
+        # Process HDC conceptual direction if provided
+        concept_field = torch.zeros_like(tensor_data)
+        if hdc_direction is not None:
+            # Blend with tensor's existing conceptual identity if available
+            if tensor_name in self.tensor_concepts:
+                tensor_concept = self.tensor_concepts[tensor_name]
+                similarity = F.cosine_similarity(
+                    tensor_concept.unsqueeze(0), hdc_direction.unsqueeze(0), dim=1
+                ).item()
+
+                # Higher similarity = more influence from existing concept
+                blended_concept = (
+                    similarity * tensor_concept + (1.0 - similarity) * hdc_direction
+                )
+                hdc_direction = blended_concept
+
+            # Project HDC vector to tensor space
+            concept_field = self._project_hdc_to_tensor(
+                hdc_direction, tensor_data.shape
+            )
+            concept_field = concept_field / concept_field.norm()
+
+        # Get adaptive blending weights
+        blend_weights = self._compute_adaptive_weights(
+            xlstm_guidance, tensor_metrics.squeeze()
+        )
+
+        # Create unified evolution field with weighted blending
+        evolution_field = (
+            blend_weights[0] * fluid_field
+            + blend_weights[1] * torch.ones_like(tensor_data) * xlstm_guidance
+            + blend_weights[2] * concept_field
+        )
+
+        # Add historical flow momentum if available
+        if tensor_name in self.flow_memory and len(self.flow_memory[tensor_name]) > 0:
+            recent_flows = self.flow_memory[tensor_name]
+            flow_pattern = self._detect_evolution_pattern(tensor_name)
+
+            if flow_pattern == "consistent":
+                # Amplify consistent momentum
+                avg_flow = sum(recent_flows) / len(recent_flows)
+                evolution_field += 0.2 * avg_flow
+            elif flow_pattern == "oscillating":
+                # Dampen oscillations with temporal averaging
+                avg_flow = sum(recent_flows) / len(recent_flows)
+                evolution_field = 0.7 * evolution_field + 0.3 * avg_flow
+
+        return evolution_field, xlstm_guidance, blend_weights
+
+    def evolve_tensor(
+        self,
+        tensor_name: str,
+        tensor_data: torch.Tensor,
+        steps: int = 20,
+        hdc_direction: Optional[torch.Tensor] = None,
+        adaptation_rate: float = 0.01,
+    ) -> torch.Tensor:
+        """Evolve tensor with unified guidance"""
+        original_tensor = tensor_data.clone()
+
+        # Calculate tensor metrics for XLSTM input
+        metrics = self.fluid.analyze(tensor_data)
+        metric_values = torch.tensor(
+            [metrics[k] for k in sorted(metrics.keys())], device=self.device
+        )
+
+        # Evolve through multiple steps
+        current = tensor_data.clone()
+        for step in range(steps):
+            # Get evolution field and guidance
+            field, guidance, _ = self.forward(
+                tensor_name, metric_values, current, hdc_direction
+            )
+
+            # Adaptive step size based on guidance confidence and stage
+            confidence = abs(guidance)
+            base_step = adaptation_rate * (0.5 + confidence)
+            step_decay = 1.0 / (1.0 + 0.1 * step)  # Gradually reduce step size
+            step_size = base_step * step_decay
+
+            # Apply evolutionary step
+            current += step_size * field
+
+            # Adaptive renormalization
+            norm_ratio = current.norm() / original_tensor.norm()
+            if (norm_ratio - 1.0).abs() > 0.1:
+                # Renormalize if magnitude has drifted by more than 10%
+                current = current * (original_tensor.norm() / current.norm())
+
+        # Update flow memory with this evolution trajectory
+        if tensor_name not in self.flow_memory:
+            self.flow_memory[tensor_name] = []
+
+        self.flow_memory[tensor_name].append((current - tensor_data).detach())
+        if len(self.flow_memory[tensor_name]) > 10:
+            self.flow_memory[tensor_name].pop(0)
+
+        return current
+
+    def _compute_adaptive_weights(
+        self, guidance: float, metrics: torch.Tensor
+    ) -> torch.Tensor:
+        """Calculate adaptive blending weights based on guidance and tensor properties"""
+        inputs = torch.cat([torch.tensor([guidance], device=self.device), metrics])
+        raw_weights = self.blend_network(inputs)
+        return F.softmax(raw_weights, dim=0)  # Ensure weights sum to 1
+
+    def _project_hdc_to_tensor(
+        self, hdc_vector: torch.Tensor, tensor_shape: torch.Size
+    ) -> torch.Tensor:
+        """Project HDC vector to tensor dimensionality with consistent mapping"""
+        shape_key = tuple(tensor_shape)
+
+        # Create projection matrix if it doesn't exist for this shape
+        if shape_key not in self._projection_matrices:
+            # Use deterministic seed based on shape for reproducibility
+            seed = sum(i * p for i, p in enumerate(shape_key)) % (2**32 - 1)
+            torch.manual_seed(seed)
+            self._projection_matrices[shape_key] = torch.randn(
+                hdc_vector.shape[0], np.prod(tensor_shape), device=self.device
+            )
+
+        # Apply projection
+        flat_projection = torch.matmul(hdc_vector, self._projection_matrices[shape_key])
+        return flat_projection.reshape(tensor_shape)
+
+    def update_tensor_concept(
+        self, tensor_name: str, hdc_vector: torch.Tensor, performance_delta: float
+    ) -> None:
+        """Update tensor's conceptual identity based on performance impact"""
+        if performance_delta <= 0:
+            return  # Only update when performance improves
+
+        # Adaptation rate proportional to performance gain (with caps)
+        rate = min(0.2, max(0.01, performance_delta * 0.05))
+
+        # Update or initialize tensor's conceptual identity
+        if tensor_name in self.tensor_concepts:
+            self.tensor_concepts[tensor_name] = (1.0 - rate) * self.tensor_concepts[
+                tensor_name
+            ] + rate * hdc_vector
+        else:
+            self.tensor_concepts[tensor_name] = hdc_vector.clone()
+
+        # Store performance delta in history
+        if tensor_name not in self.perf_memory:
+            self.perf_memory[tensor_name] = []
+
+        self.perf_memory[tensor_name].append(performance_delta)
+        if len(self.perf_memory[tensor_name]) > 20:
+            self.perf_memory[tensor_name].pop(0)
+
+    def update_projection_matrix(
+        self,
+        tensor_name: str,
+        hdc_vector: torch.Tensor,
+        tensor_data: torch.Tensor,
+        evolved_tensor: torch.Tensor,
+        performance_delta: float,
+    ) -> None:
+        """Learn better HDC->tensor projections based on successful adaptations"""
+        if performance_delta <= 0:
+            return  # Only learn from successful adaptations
+
+        shape_key = tuple(tensor_data.shape)
+        if shape_key not in self._projection_matrices:
+            return
+
+        # Calculate the actual flow direction that improved performance
+        actual_flow = (evolved_tensor - tensor_data).flatten()
+        actual_flow = actual_flow / (actual_flow.norm() + 1e-8)
+
+        # Get current projected direction
+        current_projection = torch.matmul(
+            hdc_vector, self._projection_matrices[shape_key]
+        )
+        current_projection = current_projection / (current_projection.norm() + 1e-8)
+
+        # Calculate adjustment to better align projection with successful flow
+        adjustment_rate = min(0.01, performance_delta * 0.002)
+        adjustment = (
+            adjustment_rate
+            * (actual_flow - current_projection).unsqueeze(0)
+            * hdc_vector.unsqueeze(1)
+        )
+
+        # Update projection matrix
+        self._projection_matrices[shape_key] += adjustment.to(
+            self._projection_matrices[shape_key].device
+        )
+
+    def _detect_evolution_pattern(self, tensor_name: str) -> str:
+        """Analyze flow patterns to detect oscillation, consistency, or chaos"""
+        if (
+            tensor_name not in self.flow_memory
+            or len(self.flow_memory[tensor_name]) < 4
+        ):
+            return "insufficient_data"
+
+        flows = self.flow_memory[tensor_name]
+        cosine_sims = []
+
+        # Calculate consecutive flow similarities
+        for i in range(len(flows) - 1):
+            sim = F.cosine_similarity(
+                flows[i].flatten().unsqueeze(0),
+                flows[i + 1].flatten().unsqueeze(0),
+                dim=1,
+            )
+            cosine_sims.append(sim.item())
+
+        # Analyze pattern
+        negative_sims = sum(1 for s in cosine_sims if s < -0.3)
+        positive_sims = sum(1 for s in cosine_sims if s > 0.6)
+
+        if negative_sims >= len(cosine_sims) // 2:
+            return "oscillating"  # Many opposite-direction flows
+        elif positive_sims >= len(cosine_sims) - 1:
+            return "consistent"  # Flows in consistent direction
+        else:
+            return "chaotic"  # No clear pattern
+
+    def update_blend_weights(
+        self,
+        metrics: torch.Tensor,
+        guidance: float,
+        weights: torch.Tensor,
+        performance_delta: float,
+    ):
+        """Train the adaptive blending network based on actual performance changes"""
+        if abs(performance_delta) < 0.001:
+            return  # No significant change to learn from
+
+        # Prepare inputs
+        inputs = torch.cat([torch.tensor([guidance]), metrics])
+
+        # Calculate target weights based on performance
+        # This is a simple heuristic: if performance improved, increase weights
+        # proportionally to their current values
+        if performance_delta > 0:
+            # Performance improved - amplify current successful blend
+            target_weights = weights * (1.0 + 0.1 * performance_delta)
+        else:
+            # Performance decreased - reduce weights that likely caused it
+            # Invert weights to find "opposite" blend
+            target_weights = 1.0 - weights
+
+        # Normalize target weights
+        target_weights = target_weights / target_weights.sum()
+
+        # Train blend network
+        self.blend_optimizer.zero_grad()
+        pred_weights = F.softmax(self.blend_network(inputs), dim=0)
+        loss = F.mse_loss(pred_weights, target_weights)
+        loss.backward()
+        self.blend_optimizer.step()
+
+        return loss.item()
+
+    # Tensor neighborhood influence
+    def neighborhood_influence(self, tensor_name, tensor_data):
+        influences = []
+
+        # Extract layer/module info from tensor name
+        parts = tensor_name.split(".")
+
+        # Check for "sibling" tensors in same layer
+        for name, concept in self.tensor_concepts.items():
+            name_parts = name.split(".")
+            # If tensors are in same layer or adjacent layers
+            if parts[:-1] == name_parts[:-1] or parts[:-2] == name_parts[:-2]:
+                sim = F.cosine_similarity(
+                    self.tensor_concepts[tensor_name].unsqueeze(0),
+                    concept.unsqueeze(0),
+                    dim=1,
+                ).item()
+                if sim > 0.3:  # Only use similar tensors
+                    influences.append((name, sim))
+
+        return influences
+
+
+class EnhancedFluidXLSTM(FluidXLSTM):
+    """FluidXLSTM with empirically bootstrapped metric importance"""
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int = 128,
+        hdc_dimension: int = 10000,
+        sequence_length: int = 1,
+        learning_rate: float = 1e-3,
+        device: str = "cuda",
+        metric_bootstrapper: Optional[MetricBootstrapper] = None,
+    ):
+        super().__init__(
+            input_size,
+            hidden_size,
+            hdc_dimension,
+            sequence_length,
+            learning_rate,
+            device,
+        )
+        self.bootstrapper = metric_bootstrapper
+
+        # If bootstrapper provided, use its learned weights to focus on important metrics
+        if self.bootstrapper:
+            metric_names = [m for m in sorted(self.fluid.metrics.keys())]
+            self.metric_weights, self.metric_directions = (
+                self.bootstrapper.get_metric_weights(metric_names)
+            )
+            self.metric_weights = self.metric_weights.to(self.device)
+            self.metric_directions = self.metric_directions.to(self.device)
+        else:
+            # Equal weights and positive directions as fallback
+            self.metric_weights = torch.ones(input_size) / input_size
+            self.metric_directions = torch.ones(input_size)
+
+    def forward(
+        self,
+        tensor_name: str,
+        tensor_metrics: torch.Tensor,
+        tensor_data: torch.Tensor,
+        hdc_direction: Optional[torch.Tensor] = None,
+    ):
+        """Enhanced forward with metric importance weighting"""
+        # Apply metric importance weighting to input features
+        if tensor_metrics.dim() == 1:
+            tensor_metrics = tensor_metrics.unsqueeze(0).unsqueeze(0)
+
+        # Apply learned metric directions and importance weights
+        weighted_metrics = tensor_metrics * self.metric_directions * self.metric_weights
+
+        # Continue with normal forward pass using weighted metrics
+        return super().forward(
+            tensor_name, weighted_metrics, tensor_data, hdc_direction
+        )
+
+    def update_with_performance_data(
+        self, tensor_name: str, metrics: Dict[str, float], performance_delta: float
+    ):
+        """Record new performance data for continuous bootstrapping"""
+        if not hasattr(self, "new_performance_data"):
+            self.new_performance_data = defaultdict(list)
+
+        # Store new data points for future retraining
+        for metric_name, value in metrics.items():
+            self.new_performance_data[metric_name].append((value, performance_delta))
+
+        # If we have enough new data, update metric weights and directions
+        if sum(len(data) for data in self.new_performance_data.values()) > 100:
+            self._update_metric_weights()
+
+    def _update_metric_weights(self):
+        """Update metric weights and directions based on new performance data"""
+        if not hasattr(self, "new_performance_data"):
+            return
+
+        metric_names = sorted(self.fluid.metrics.keys())
+        new_weights = []
+        new_directions = []
+
+        for name in metric_names:
+            if (
+                name in self.new_performance_data
+                and len(self.new_performance_data[name]) >= 5
+            ):
+                values, deltas = zip(*self.new_performance_data[name])
+                values = torch.tensor(values)
+                deltas = torch.tensor(deltas)
+
+                # Calculate correlation
+                mean_v, mean_d = values.mean(), deltas.mean()
+                cov = ((values - mean_v) * (deltas - mean_d)).mean()
+                std_v, std_d = values.std(), deltas.std()
+
+                if std_v > 0 and std_d > 0:
+                    corr = cov / (std_v * std_d)
+                    weight = abs(corr.item())
+                    direction = torch.sign(corr).item()
+                else:
+                    weight = 0.1  # Default
+                    direction = 1.0  # Default positive
+
+                new_weights.append(weight)
+                new_directions.append(direction)
+            else:
+                # Keep existing weight/direction
+                idx = metric_names.index(name)
+                new_weights.append(self.metric_weights[idx].item())
+                new_directions.append(self.metric_directions[idx].item())
+
+        # Update weights and directions
+        new_weights = torch.tensor(new_weights, device=self.device)
+        new_directions = torch.tensor(new_directions, device=self.device)
+
+        # Blend with existing weights (smooth transition)
+        self.metric_weights = 0.7 * self.metric_weights + 0.3 * F.softmax(
+            new_weights, dim=0
+        )
+        self.metric_directions = 0.7 * self.metric_directions + 0.3 * new_directions
+
+        # Clear accumulated data
+        self.new_performance_data.clear()
 
 
 class XLSTM(nn.Module):
@@ -2129,6 +2571,220 @@ class XLSTM(nn.Module):
                 )  # Just apply control signal for prediction
                 outputs.append(adjusted_output)
             return torch.stack(outputs, dim=1)
+
+
+class SFTDataset(Dataset):
+    def __init__(self, sft_data_list):  # sft_data_list is your list of SFT dictionaries
+        self.sft_data = sft_data_list
+
+    def __len__(self):
+        return len(self.sft_data)
+
+    def __getitem__(self, idx):
+        return self.sft_data[idx]  # Return the SFT dictionary directly
+
+
+class HyperdimensionalEncoder:
+    def __init__(self, dimension=10000, seed=42):
+        np.random.seed(seed)
+        self.dimension = dimension
+        self.token_vectors = {}
+
+    def generate_random_vector(self):
+        return np.random.choice([-1, 1], size=(self.dimension,))
+
+    def encode_text(self, text):
+        words = text.split()
+        encoded_vector = np.zeros(self.dimension)
+        for word in words:
+            if word not in self.token_vectors:
+                self.token_vectors[word] = self.generate_random_vector()
+            encoded_vector += self.token_vectors[word]
+        return np.sign(encoded_vector)
+
+    def similarity(self, vec1, vec2):
+        return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+
+
+class HDC_Evolution_Controller:
+    def __init__(self, model, dimension=10000):
+        self.model = model
+        self.hdc = HyperdimensionalEncoder(dimension)
+        self.fluid = FluidAnalyzer(device="cuda")
+        self.xlstm = XLSTM(input_size=20, hidden_size=128, sequence_length=1)
+
+        # The evolution memory - tracks how tensors respond to different HDC-guided perturbations
+        self.tensor_hdc_memory = {}  # tensor_name -> HDC vector of its "conceptual identity"
+        self.response_memory = {}  # (tensor_name, hdc_direction) -> performance_delta
+
+    def evolve_with_hdc_guidance(self, input_data, expected_output):
+        # 1. Extract HDC vectors from input and expected output
+        input_hdc = self.hdc.encode_text(input_data)
+        target_hdc = self.hdc.encode_text(expected_output)
+
+        # 2. Compute the "conceptual direction" we want to move in HDC space
+        hdc_direction = target_hdc - input_hdc
+
+        # 3. Find tensors most aligned with this conceptual direction
+        candidate_tensors = []
+        for name, param in self.model.named_parameters():
+            if name in self.tensor_hdc_memory:
+                tensor_concept = self.tensor_hdc_memory[name]
+                alignment = self.hdc.similarity(tensor_concept, hdc_direction)
+                if (
+                    alignment > 0.2
+                ):  # Only evolve tensors that are conceptually relevant
+                    candidate_tensors.append((name, param, alignment))
+
+        # 4. Let XLSTM predict which tensors will respond best to evolution
+        for name, param, alignment in sorted(
+            candidate_tensors, key=lambda x: x[2], reverse=True
+        )[:5]:
+            # Extract tensor metrics as XLSTM input
+            metrics = self.fluid.analyze(param.data)
+            metrics_tensor = torch.tensor([metrics[k] for k in sorted(metrics.keys())])
+
+            # Get XLSTM prediction
+            predicted_benefit, _ = self.xlstm(metrics_tensor.unsqueeze(0).unsqueeze(0))
+            predicted_benefit = predicted_benefit.item()
+
+            if predicted_benefit > 0.2:
+                # 5. Evolve using fluid dynamics, but guided by HDC direction
+                # This is the key integration point - fluid evolution guided by conceptual direction
+                evolved = self.evolve_tensor_with_hdc_guide(param.data, hdc_direction)
+
+                # 6. Measure actual benefit
+                original_output = self.model(input_data)
+                with torch.no_grad():
+                    param.data.copy_(evolved)
+                    new_output = self.model(input_data)
+
+                actual_benefit = self.measure_improvement(
+                    original_output, new_output, expected_output
+                )
+
+                # 7. Update memories
+                key = (name, tuple(hdc_direction.tolist()))
+                self.response_memory[key] = actual_benefit
+
+                # 8. Update tensor's conceptual identity based on what it learned
+                if actual_benefit > 0:
+                    # Tensor moved toward the conceptual direction, so update its identity
+                    self.tensor_hdc_memory[name] = (
+                        0.9 * self.tensor_hdc_memory.get(name, hdc_direction)
+                        + 0.1 * hdc_direction
+                    )
+
+                    # And train the XLSTM to better predict benefits
+                    self.xlstm.adjust_tensor_evolution(
+                        metrics_tensor.unsqueeze(0).unsqueeze(0),
+                        torch.tensor([actual_benefit]).unsqueeze(0).unsqueeze(0),
+                    )
+                else:
+                    # Revert if no benefit
+                    with torch.no_grad():
+                        param.data.copy_(param.original_data)
+
+    def evolve_tensor_with_hdc_guide(self, tensor, hdc_direction):
+        # The magic integration - fluid evolution that's biased toward HDC direction
+        # Convert HDC direction into a bias field for the fluid evolution
+
+        # 1. Project HDC vector down to tensor dimensionality using random projection
+        random_proj = torch.randn(hdc_direction.shape[0], tensor.numel())
+        bias_field = torch.matmul(hdc_direction, random_proj).reshape(tensor.shape)
+
+        # 2. Normalize the bias field
+        bias_field = bias_field / bias_field.norm()
+
+        # 3. Run fluid evolution with this bias field as a guide
+        return self.fluid.evolve_with_bias(tensor, bias_field, steps=20)
+
+    def temporal_integration(self, current_hdc, predicted_future_hdc):
+        # Integrate current perceptions with predicted future states
+        memory_trace = torch.zeros_like(current_hdc)
+
+        # Scan historical HDC activations with decaying influence
+        for i, (past_hdc, timestamp) in enumerate(self.hdc_history):
+            time_decay = math.exp(-(self.current_time - timestamp) / self.memory_decay)
+            similarity = torch.cosine_similarity(current_hdc, past_hdc, dim=0)
+            memory_trace += time_decay * similarity * past_hdc
+
+        # Blend current perception, memory trace, and prediction
+        integrated = 0.4 * current_hdc + 0.3 * memory_trace + 0.3 * predicted_future_hdc
+        self.hdc_history.append((integrated, self.current_time))
+
+        return integrated
+
+
+class UniversalCompression:
+    """Extract pure signal manifolds from tensor noise"""
+
+    def __init__(self, fluid_xlstm: FluidXLSTM):
+        self.fluid_xlstm = fluid_xlstm
+        self.signal_cache = {}  # tensor_name -> extracted signals
+
+    def compress(
+        self, tensor_name: str, tensor: torch.Tensor, signal_threshold: float = 0.7
+    ) -> torch.Tensor:
+        """Extract clean signal manifold from noisy tensor"""
+        # Get flow field using fluid dynamics
+        metrics = self.fluid_xlstm.fluid.analyze(tensor)
+        metric_values = torch.tensor([metrics[k] for k in sorted(metrics.keys())])
+
+        # Let tensor evolve toward natural equilibrium state
+        flow_field, _, _ = self.fluid_xlstm.forward(tensor_name, metric_values, tensor)
+
+        # Use the flow field to guide evolution toward equilibrium
+        evolved = tensor.clone()
+        for _ in range(20):  # Multiple evolution steps
+            evolved += 0.02 * flow_field
+
+        # Extract principal components using SVD
+        U, S, V = torch.linalg.svd(evolved, full_matrices=False)
+
+        # Find energy threshold cutoff
+        total_energy = torch.sum(S**2)
+        energy_ratio = (S**2).cumsum(0) / total_energy
+
+        # Keep components that capture signal_threshold of variance
+        k = torch.searchsorted(energy_ratio, signal_threshold) + 1
+
+        # Reconstruct using only principal components
+        signals = torch.matmul(U[:, :k] * S[:k], V[:k, :])
+
+        # Store in cache
+        self.signal_cache[tensor_name] = {
+            "signals": signals,
+            "energy_distribution": S,
+            "principal_directions": V[:k, :],
+        }
+
+        return signals
+
+    def extract_concepts(
+        self, tensor_name: str, hdc_encoder: HyperdimensionalEncoder
+    ) -> torch.Tensor:
+        """Convert signal manifold into conceptual HDC vector"""
+        if tensor_name not in self.signal_cache:
+            return None
+
+        signal_data = self.signal_cache[tensor_name]
+
+        # Use top principal components as "words" in HDC space
+        directions = signal_data["principal_directions"]
+        hdc_vectors = []
+
+        for i, direction in enumerate(directions):
+            # Create an HDC vector for each principal direction
+            hdc_vector = hdc_encoder.generate_random_vector()
+            weight = signal_data["energy_distribution"][i].item()
+            hdc_vectors.append((hdc_vector, weight))
+
+        # Blend HDC vectors based on energy contribution
+        total_weight = sum(w for _, w in hdc_vectors)
+        concept_vector = sum(v * (w / total_weight) for v, w in hdc_vectors)
+
+        return concept_vector
 
 
 @torch.inference_mode()
