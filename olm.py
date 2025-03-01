@@ -14,7 +14,7 @@ import sqlite3
 import uuid
 from datetime import datetime
 
-from get_model_metric import ModelLoaderFromDatabase, ModelDatabase
+from fluid_cognative_architecture import ModelLoaderFromDatabase, ModelDatabase
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s > %(message)s")
 logger = logging.getLogger(__name__)
@@ -448,6 +448,63 @@ def compute_exact_match(
     return avg_loss
 
 
+def compute_uncertain_bigram(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    conversation: Dict,
+) -> float:
+    """Compute bigram loss that rewards correct responses and distribution preservation."""
+    context = get_context(conversation)
+    expected_response = f"{conversation['conversation'][-1]['value']}"
+    context_ids = tokenizer(context, return_tensors="pt").to(model.device)
+    response_ids = tokenizer(expected_response, return_tensors="pt").to(model.device)
+    full_ids = torch.cat([context_ids.input_ids, response_ids.input_ids], dim=1).to(
+        model.device
+    )
+    outputs = model(full_ids)
+    shift_logits = outputs.logits[:, context_ids.input_ids.size(1) - 1 : -2, :]
+    next_logits = outputs.logits[:, context_ids.input_ids.size(1) : -1, :]
+    shift_probs = torch.softmax(shift_logits, dim=-1)
+    next_probs = torch.softmax(next_logits, dim=-1)
+    shift_labels = response_ids.input_ids[:, :-1]
+    next_labels = response_ids.input_ids[:, 1:]
+    shift_correct = torch.gather(shift_probs, 2, shift_labels.unsqueeze(-1)).squeeze(-1)
+    next_correct = torch.gather(next_probs, 2, next_labels.unsqueeze(-1)).squeeze(-1)
+    shift_max, _ = torch.max(shift_probs, dim=-1)
+    next_max, _ = torch.max(next_probs, dim=-1)
+    shift_loss = 1.0 - (shift_correct / (shift_max + 1e-10))
+    next_loss = 1.0 - (next_correct / (next_max + 1e-10))
+    combined_loss = (shift_loss + next_loss).mean().item()
+    return combined_loss
+
+
+def compute_exact_uncertain_match(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    conversation: Dict,
+) -> float:
+    """Lower scores are better: (correct + uncertain) < (correct + certain) < (incorrect uncertain) < (incorrect certain)"""
+    context = get_context(conversation)
+    expected_response = f"{conversation['conversation'][-1]['value']}"
+    context_ids = tokenizer(context, return_tensors="pt").to(model.device)
+    expected_ids = tokenizer(expected_response, return_tensors="pt").to(model.device)
+    all_logits = []
+    current_ids = context_ids.input_ids
+    for i in range(len(expected_ids.input_ids[0])):
+        outputs = model(current_ids)
+        all_logits.append(outputs.logits[:, -1:, :].detach())
+    response_logits = torch.cat(all_logits, dim=1)
+    probs = torch.softmax(response_logits, dim=-1)
+    predicted_tokens = response_logits.argmax(dim=-1)
+    correct_mask = predicted_tokens == expected_ids.input_ids
+    max_probs = probs.max(dim=-1).values
+    num_tokens = float(len(all_logits))
+    wrongness_penalty = 1.0 / (1.0 - max_probs + 1e-10)
+    capped_penalty = torch.minimum(1.0 + wrongness_penalty, torch.tensor(num_tokens))
+    result = torch.where(correct_mask, max_probs, capped_penalty)
+    return float(result.mean().item())
+
+
 def evaluate_model_on_dataset(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
@@ -472,12 +529,15 @@ def evaluate_model_on_dataset(
             metric = compute_response_perplexity(model, tokenizer, conversation)
         elif mode == "quality":
             metric = compute_response_quality(model, tokenizer, conversation)
+        elif mode == "uncertain_bigram":
+            metric = compute_uncertain_bigram(model, tokenizer, conversation)
+        elif mode == "exact_uncertain":
+            metric = compute_exact_uncertain_match(model, tokenizer, conversation)
         total_metric += metric
 
     model.to("cpu")
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
-
     return total_metric / len(dataset)
 
 
@@ -639,38 +699,6 @@ def _evaluate_model_candidates(
     return layer_metrics
 
 
-def select_base_model(
-    models_dir: str, models: List[str], datasets: Dict, selected_metric: str
-) -> str:
-    """Select the best base model based on a specific metric."""
-    selected_datasets = {
-        name: dataset
-        for name, dataset in datasets.items()
-        if dataset["mode"] == selected_metric
-    }
-
-    def eval_func(model, tokenizer, dataset):
-        return evaluate_model_on_dataset(
-            model, tokenizer, dataset["data"], dataset["mode"]
-        )
-
-    layer_metrics = _evaluate_model_candidates(
-        models, models_dir, selected_datasets, eval_func
-    )
-
-    valid_models = set(models)
-    model_ranks = {
-        model: compute_model_ranks(model, layer_metrics, valid_models)
-        for model in valid_models
-        if all(model in scores for scores in layer_metrics.values())
-    }
-
-    if not model_ranks:
-        raise RuntimeError("No valid base models found")
-
-    return select_best_model(model_ranks)
-
-
 def get_base_metrics(
     base_path: Path,
     output_dir: str,
@@ -804,107 +832,6 @@ def _apply_boundary_components(
     working_model.lm_head.load_state_dict(source_model.lm_head.state_dict())
 
 
-def get_boundary_layers(
-    working_model: AutoModelForCausalLM,
-    config: Dict,
-    datasets: Dict,
-    tokenizer: AutoTokenizer,
-) -> Dict:
-    """Select boundary components based on dataset performance."""
-    models_dir = config["models_dir"]
-    output_dir = config["output_dir"]
-    report_path = os.path.join(output_dir, "merge_report.json")
-    boundary_metric = config.get("boundary_select", "quality")
-
-    if os.path.exists(report_path):
-        merge_report = json.load(open(report_path))
-    else:
-        merge_report = {}
-
-    logger.info(f"Selecting boundary components for best {boundary_metric} performance")
-    component_metrics = {dataset: {} for dataset in datasets}
-
-    original_states = {
-        "embed_tokens": working_model.model.embed_tokens.state_dict(),
-        "norm": working_model.model.norm.state_dict(),
-        "lm_head": working_model.lm_head.state_dict(),
-    }
-
-    def eval_func(model, tokenizer, dataset):
-        return evaluate_model_on_dataset(
-            model, tokenizer, dataset["data"], dataset["mode"]
-        )
-
-    for model_name in config["models"]:
-        try:
-            source, _ = load_model(
-                f"{models_dir}/{model_name.replace('/', '_')}", "cpu"
-            )
-
-            _apply_boundary_components(working_model, source)
-
-            for dataset_name, dataset in datasets.items():
-                if dataset["mode"] == boundary_metric:
-                    metric = eval_func(working_model, tokenizer, dataset)
-                    component_metrics[dataset_name][model_name] = metric
-                    logger.info(f"{model_name}: {dataset_name}: {metric}")
-                else:
-                    component_metrics[dataset_name][model_name] = float("inf")
-
-            del source
-
-        except Exception as e:
-            logger.error(f"Error testing components from {model_name}: {e}")
-            continue
-
-        for component_name, state in original_states.items():
-            getattr(
-                working_model.model if component_name != "lm_head" else working_model,
-                component_name,
-            ).load_state_dict(state)
-
-    selected_datasets = [
-        name for name, ds in datasets.items() if ds["mode"] == boundary_metric
-    ]
-    model_scores = {}
-
-    for model_name in config["models"]:
-        try:
-            scores = [component_metrics[ds][model_name] for ds in selected_datasets]
-            if all(score != float("inf") for score in scores):
-                model_scores[model_name] = sum(scores) / len(scores)
-        except Exception as e:
-            logger.error(f"Error calculating scores for {model_name}: {e}")
-            continue
-
-    if model_scores:
-        best_model = min(model_scores.items(), key=lambda x: x[1])[0]
-
-        source, _ = load_model(f"{models_dir}/{best_model.replace('/', '_')}", "cpu")
-
-        _apply_boundary_components(working_model, source)
-
-        logger.info(f"Applied boundary components from {best_model}")
-
-        if "boundary_layers" not in merge_report:
-            merge_report["boundary_layers"] = {}
-
-        merge_report["boundary_layers"] = {
-            "name": best_model,
-            "metrics": {
-                dataset_name: component_metrics[dataset_name][best_model]
-                for dataset_name in selected_datasets
-            },
-        }
-
-        del source
-
-    working_model.save_pretrained(output_dir)
-    json.dump(merge_report, open(report_path, "w"), indent=4)
-
-    return merge_report, working_model
-
-
 # --- layer and tensor selection ---
 
 
@@ -923,7 +850,7 @@ def replace_sublayer(
 def save_tensor_state(
     model: AutoModelForCausalLM,
     tensor_metrics: Dict,
-    tensor_name: str,  # One name to rule them all
+    tensor_name: str,
     output_dir: str,
     best_model: str,
 ) -> None:
@@ -932,7 +859,6 @@ def save_tensor_state(
     model.save_pretrained(output_dir)
     report_path = os.path.join(output_dir, "merge_report.json")
     report = json.load(open(report_path)) if os.path.exists(report_path) else {}
-
     if "tensors" not in report:
         report["tensors"] = {}
     report["tensors"][tensor_name] = {
@@ -1036,21 +962,17 @@ def tensor_wise_optimization(
     merge_report: Dict,
 ) -> AutoModelForCausalLM:
     """Tensor optimization: Computational natural selection, one tensor at a time."""
-
     tensor_map = {
         name: param
         for name, param in working_model.named_parameters()
         if "weight" in name
     }
-
-    # Reverse the tensor_map for the backward direction
     direction = config.get("direction", "forward")
     if direction == "backward":
         tensor_map = dict(reversed(list(tensor_map.items())))
 
     skip_norm = config.get("skip_norm", False)
     for tensor_name, tensor in tensor_map.items():
-        # keep base norm tensors speed up the process
         if "norm" in tensor_name and skip_norm:
             logger.info(f"Keeping base model normalization tensor: {tensor_name}")
             continue
@@ -1058,7 +980,6 @@ def tensor_wise_optimization(
         logger.info(f"\nOptimizing tensor: {tensor_name}")
         layer_metrics = {dataset_name: {} for dataset_name in datasets}
         original_weights = tensor.data.clone()
-
         for model_name in model_pool:
             try:
                 source_model, _ = load_model(
@@ -1081,7 +1002,6 @@ def tensor_wise_optimization(
                         improve_all=config.get("improve_all"),
                         skip_quality=config.get("skip_quality", False),
                     )
-
                     if any(
                         model_name in ds and ds[model_name] == float("inf")
                         for ds in layer_metrics.values()
@@ -1109,12 +1029,10 @@ def tensor_wise_optimization(
             )
             best_tensor = dict(best_source_model.named_parameters())[tensor_name]
             tensor.data.copy_(best_tensor.data)
-
             save_tensor_state(
                 working_model, layer_metrics, tensor_name, output_dir, best_model
             )
             logger.info(f"Tensor {tensor_name} upgraded with parts from {best_model}")
-
             del best_source_model
 
             working_model.save_pretrained(
@@ -1128,29 +1046,152 @@ def tensor_wise_optimization(
     return working_model
 
 
+def select_component(
+    component_type: str,  # "base", "boundary", or "layer"
+    models_dir: str,
+    model_pool: List[str],
+    datasets: Dict,
+    config: Dict,
+    working_model: Optional[AutoModelForCausalLM] = None,
+    tokenizer: Optional[AutoTokenizer] = None,
+) -> Tuple[str, Dict]:
+    """Unified selection for any model component (base, boundary layers, or regular layers)."""
+    logger.info(f"Selecting optimal {component_type}...")
+
+    selection_metric = config.get(f"{component_type}_select", "uncertain_bigram")
+    selected_datasets = {
+        name: dataset
+        for name, dataset in datasets.items()
+        if dataset["mode"] == selection_metric or selection_metric == "all"
+    }
+
+    if not selected_datasets:
+        selected_datasets = datasets  # Fallback to all datasets
+
+    # For base model evaluate each model directly
+    if component_type == "base":
+        component_metrics = _evaluate_model_candidates(
+            model_pool,
+            models_dir,
+            selected_datasets,
+            lambda model, tokenizer, dataset: evaluate_model_on_dataset(
+                model, tokenizer, dataset["data"], dataset["mode"]
+            ),
+        )
+
+    # For boundary layers swap them into the working model and evaluate
+    elif component_type == "boundary":
+        component_metrics = {dataset_name: {} for dataset_name in selected_datasets}
+        original_states = {}
+
+        # Backup original states if we're modifying a working model
+        if working_model:
+            original_states = {
+                "embed_tokens": working_model.model.embed_tokens.state_dict(),
+                "norm": working_model.model.norm.state_dict(),
+                "lm_head": working_model.lm_head.state_dict(),
+            }
+
+        for model_name in model_pool:
+            try:
+                if working_model: # Apply boundary components to working model
+                    source, _ = load_model(
+                        f"{models_dir}/{model_name.replace('/', '_')}", "cpu"
+                    )
+                    _apply_boundary_components(working_model, source)
+                    test_model, test_tokenizer = working_model, tokenizer
+                    del source
+                else: # load the model directly if no working model
+                    test_model, test_tokenizer = load_model(
+                        f"{models_dir}/{model_name.replace('/', '_')}", "cpu"
+                    )
+
+                # Evaluate on selected datasets
+                for dataset_name, dataset in selected_datasets.items():
+                    metric = evaluate_model_on_dataset(
+                        test_model, test_tokenizer, dataset["data"], dataset["mode"]
+                    )
+                    component_metrics[dataset_name][model_name] = metric
+                    logger.info(f"{model_name}: {dataset_name}: {metric}")
+
+                # Restore original boundary layers
+                if working_model and original_states:
+                    for component_name, state in original_states.items():
+                        getattr(
+                            working_model.model
+                            if component_name != "lm_head"
+                            else working_model,
+                            component_name,
+                        ).load_state_dict(state)
+
+                if component_type == "base" and test_model != working_model:
+                    del test_model
+
+            except Exception as e:
+                logger.error(f"Error evaluating {model_name}: {e}")
+                continue
+
+    # Calculate ranks and select best model
+    valid_models = set(
+        model_name
+        for model_name in model_pool
+        if any(model_name in metrics for metrics in component_metrics.values())
+    )
+
+    model_ranks = {}
+    for model_name in valid_models:
+        ranks = []
+        for dataset_name, dataset_scores in component_metrics.items():
+            if model_name not in dataset_scores:
+                continue
+            sorted_models = sorted(dataset_scores.items(), key=lambda x: x[1])
+            rank = (
+                next(i for i, (m, _) in enumerate(sorted_models) if m == model_name) + 1
+            )
+            ranks.append(rank)
+        if ranks:
+            model_ranks[model_name] = ranks
+
+    if not model_ranks:
+        raise RuntimeError(f"No valid models found for {component_type} selection")
+
+    best_model = min(model_ranks.items(), key=lambda x: sum(x[1]))[0]
+    avg_rank = sum(model_ranks[best_model]) / len(model_ranks[best_model])
+    logger.info(f"Selected {component_type}: {best_model} (avg rank: {avg_rank:.2f})")
+
+    return best_model, component_metrics
+
+
 # --- Main OLM Function ---
 
 
 def olm(config: Dict, merge_report: str) -> str:
-    """Main Optimal Layer Merging (OLM) function."""
-
+    """Main Optimal Layer Merging (OLM) function with unified selection."""
     models_dir = config["models_dir"]
     output_dir = config["output_dir"]
     datasets = get_datasets(config)
     layer_swap = config.get("layer_swap", False)
     tensor_swap = config.get("tensor_swap", False)
-    boundary_select = config.get("boundary_select", None)
+    base_select = config.get("base_select", False)
+    boundary_select = config.get("boundary_select", False)
+    load_merge_report = config.get("load_merge_report", False)  
 
     logger.info("Downloading required models...")
     for model_name in config["models"]:
         download_model(model_name, models_dir)
 
-    base_model_name = config.get("base_model_name")
-    if not base_model_name:
-        logger.info("Base model not provided. Selecting the best base model...")
-        base_model_name = select_base_model(
-            models_dir, config["models"], datasets, config.get("base_select", "quality")
+    if base_select:
+        base_model_name, base_metrics_dict = select_component(
+            "base", models_dir, config["models"], datasets, config
         )
+    else:
+        base_model_name = config.get("base_model_name")
+        if not base_model_name:
+            logger.info(
+                "Base model not provided and OLM selection disabled. Using first model..."
+            )
+            base_model_name = config["models"][0]
+
     logger.info(f"Selected base model: {base_model_name}")
     base_path = Path(models_dir) / base_model_name.replace("/", "_")
 
@@ -1165,25 +1206,49 @@ def olm(config: Dict, merge_report: str) -> str:
             str(base_path), "cpu", config.get("database_dir", None)
         )
 
-    if boundary_select:
-        logger.info("Optimizing boundary layers...")
-        merge_report, working_model = get_boundary_layers(
-            working_model, config, datasets, tokenizer
-        )
-
-    logger.info("Computing base metrics...")
     report_path = os.path.join(output_dir, "merge_report.json")
-    get_base_metrics(
-        base_path, output_dir, base_model_name, datasets, working_model, tokenizer
-    )
-
-    if os.path.exists(report_path):
+    if os.path.exists(report_path) and load_merge_report:
         logger.info("Loading existing merge report...")
         merge_report = json.load(open(report_path))
     else:
         logger.info("Initializing new merge report...")
         merge_report = {}
+
+    if "base_model" not in merge_report:
+        get_base_metrics(
+            base_path, output_dir, base_model_name, datasets, working_model, tokenizer
+        )
+        merge_report = json.load(open(report_path))
+
     base_metrics = merge_report["base_model"]["metrics"]
+
+    if boundary_select:
+        boundary_model, boundary_metrics = select_component(
+            "boundary",
+            models_dir,
+            config["models"],
+            datasets,
+            config,
+            working_model,
+            tokenizer,
+        )
+        boundary_source, _ = load_model(
+            f"{models_dir}/{boundary_model.replace('/', '_')}", "cpu"
+        )
+        _apply_boundary_components(working_model, boundary_source)
+        del boundary_source
+
+        merge_report["boundary_layers"] = {
+            "name": boundary_model,
+            "metrics": {
+                dataset_name: scores[boundary_model]
+                for dataset_name, scores in boundary_metrics.items()
+                if boundary_model in scores
+            },
+        }
+
+        working_model.save_pretrained(output_dir)
+        json.dump(merge_report, open(report_path, "w"), indent=4)
 
     if layer_swap:
         logger.info("Starting layer-wise optimization...")
@@ -1213,12 +1278,6 @@ def olm(config: Dict, merge_report: str) -> str:
             merge_report=merge_report,
         )
 
-    if boundary_select:
-        logger.info("Optimizing boundary layers...")
-        merge_report, working_model = get_boundary_layers(
-            working_model, config, datasets, tokenizer
-        )
-
     db_dir = config.get("db_dir", None)
     if db_dir:
         save_merge_report_to_database(merge_report, db_dir)
@@ -1232,10 +1291,8 @@ def olm(config: Dict, merge_report: str) -> str:
 @torch.inference_mode()
 def main(config_path: str, merge_report: str = None) -> None:
     """Main entry point."""
-
     with open(config_path) as f:
         config = yaml.safe_load(f)
-
     try:
         output_path = olm(config, merge_report)
         print(f"Results saved to: {output_path}")
