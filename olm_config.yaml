@@ -1,22 +1,23 @@
-direction: "forward"  # "backward" or "forward"
-models_dir: "E:/input_models/"
-output_dir: "D:/merged_model/"
+direction: "backward"  # "backward" or "forward"
+models_dir: "./input_models/"
+output_dir: "./merged_model/"
 metric_dir: "./metrics/"
 dataset_dir: "./benchmarks/"
 db_dir:  # either blank or a directory path to store and retreive from a sqlite db
 skip_quality: false
-layer_swap: false
+layer_swap: true
 tensor_swap: true
 skip_norm: false
-base_select: "bigram" # "quality" "bigram", "exact"
-boundary_select:  # "quality", "bigram", "exact", or model name, or none
-improve_all:  # "quality" "bigram", "exact", "all", "base", or blank
+base_select: true 
+boundary_select: true
+load_merge_report: false
+improve_all: "base" # "quality" "bigram", "exact", "all", "base", or blank
 samples: 200 # (tbd) implement code to process this for number of dataset samples to evaluate 
-base_model_name: "jeffmeloy/Qwen2.5-7B-olm-v1.1"
+base_model_name: 
 models_db: # if blank use only file system files. if true then use sqlite db to store composite model layer composition info and corresponding dataset metrics
 
 models: # uncomment the models you want to merge
-## Qwen2.5 7B Models ## 
+## Qwen2.5 7B Models ##
 - "AIDC-AI/Marco-o1"
 - "AlekseyKorshuk/ai-detection-gutenberg-human-v2-formatted-ai-sft-qwen-7b-sft-3epochs"
 - "allura-org/Teleut-7b"
@@ -119,20 +120,20 @@ models: # uncomment the models you want to merge
 
 dataset:
   "ifeval_sharegpt.json":
-    mode: "bigram" 
+    mode: "uncertain_bigram" 
   "bbh_sharegpt.json":
-    mode: "exact"
-  "qpqa_sharegpt.json":
-    mode: "bigram"
+    mode: "exact_uncertain"
+  "qpqa_sharegpt.json": # too much memory for exact
+    mode: "uncertain_bigram" 
   "math_lvl5_sharegpt.json":
-    mode: "exact"
+    mode: "exact_uncertain"
   "mmlupro_sharegpt.json":
-    mode: "exact"
+    mode: "exact_uncertain"
   "musr_sharegpt.json":
-    mode: "exact"
+    mode: "exact_uncertain"
   "truthfulqa_sharegpt.json":
-   mode: "exact"
+   mode: "exact_uncertain"
   "arc_sharegpt.json":
-    mode: "exact"
-#  "longresponse_sharegpt.json":
-#    mode: "quality"
+    mode: "exact_uncertain"
+  "longresponse_sharegpt.json":
+    mode: "quality"
