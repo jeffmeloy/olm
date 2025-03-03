@@ -17,44 +17,63 @@ import tempfile
 from torch import Tensor
 import torch.nn as nn
 import torch.nn.functional as F
-from collections import Counter
+from collections import Counter, deque
 import math
 from torch.utils.data import Dataset
+import random
+import time
 
 """
-Project Goal: Develop system to adaptively learn and optimize transformer model tensor selections based on the prompt, context, tensor analysis and clustering, while minimizing hyperparameter tuning and manual intervention.  Fluid dynamics (proxy for free energy principle dynamics), spectral, statistical, information theory, and topological metrics will be used to analyze tensor properties and guide model selection.  The system will use a combination of HDC, clustering, and reinforcement learning to optimize tensor selection and model performance. 
+Project Goal: Develop a system for adaptive tensor analysis, model optimization, and reinforcement learning-driven tensor selection for transformer models. The system integrates multi-framework tensor analysis (fluid dynamics, spectral, statistical, topological, and information theory metrics) with hyperdimensional computing (HDC) and reinforcement learning to optimize tensor selection and model performance.
 
 Key Components:
 
-Database Layer
-- Tensor metric extraction and storage using UUID-based relationships
-- HDC signature generation and indexing
-- Cross-tensor metric computation for relationship mapping
-- Model reconstruction from tensor combinations
+1. **Database Layer**:
+   - Stores tensor metadata, metrics, and relationships using UUID-based indexing.
+   - Manages model configurations, tensor loading orders, and HDC signatures.
+   - Supports cross-tensor metric computation and model reconstruction from tensor combinations.
 
-HDC Signature System
-- Convert tensor metrics into unified high-dimensional signatures
-- Map tensor relationships in signature space
-- Enable fast similarity search and pattern matching
-- Learn signature-to-performance correlations
+2. **Tensor Analysis**:
+   - Computes multi-framework metrics (e.g., fluid dynamics, spectral, topological).
+   - Tracks temporal evolution of tensor properties.
+   - Correlates tensor metrics with model performance.
 
-Tensor Analysis
-- Multi-framework metric computation (fluid dynamics, spectral, topological)
-- Cross-tensor relationship analysis
-- Temporal evolution tracking
-- Performance correlation discovery
+3. **Hyperdimensional Computing (HDC)**:
+   - Converts tensor metrics into high-dimensional signatures for fast similarity search.
+   - Maps tensor relationships in HDC space for pattern recognition and clustering.
+   - Enables adaptive signature refinement based on performance feedback.
 
-TODO: Implement tensor analysis functions
-1. Adaptive signature refinement based on performance feedback
-2. Signature-guided tensor mixing for optimal model composition
-3. Automatic discovery of functionally similar tensors across architectures
-4. Dynamic signature space mapping for online model optimization
-5. Metric importance weighting based on downstream task performance
-6. Signature-based tensor substitution recommendations
-7. Add an xlstm outer loop to learn for the transformer model output using the transformer model input and the context
-8. Add a reinforcement learning loop to optimize the tensor selection and model performance
-9. Break out of our simulated reality and escape into the real world
+4. **Model Management**:
+   - Downloads, processes, and stores models and their tensors.
+   - Reconstructs models from stored tensors and configurations.
+   - Validates model integrity and tensor consistency.
+
+5. **Reinforcement Learning (RL)**:
+   - Uses swarm intelligence and evolutionary strategies to optimize tensor selection.
+   - Integrates Q-learning and HDC for adaptive decision-making.
+   - Dynamically adjusts exploration and exploitation strategies based on performance.
+
+6. **Tensor Optimization**:
+   - Automatically discovers functionally similar tensors across architectures.
+   - Recommends tensor substitutions based on HDC signatures and task performance.
+   - Dynamically maps tensor relationships for online model optimization.
+
+Key Features:
+- **Adaptive Learning**: Refines tensor selection strategies based on performance feedback.
+- **Multi-Framework Analysis**: Combines fluid dynamics, spectral, and topological metrics for comprehensive tensor evaluation.
+- **HDC Integration**: Uses hyperdimensional computing for efficient tensor relationship mapping and similarity search.
+- **Reinforcement Learning**: Optimizes tensor selection through swarm intelligence and evolutionary algorithms.
+- **Model Reconstruction**: Reconstructs models from stored tensors and configurations for inference and further analysis.
+
+TODO:
+1. Implement adaptive signature refinement based on performance feedback.
+2. Add reinforcement learning loops for tensor selection optimization.
+3. Enhance cross-tensor relationship analysis for better model composition.
+4. Integrate xLSTM for learning transformer model outputs based on inputs and context.
+5. Improve fluid dynamics and topological metrics for tensor analysis.
+6. Add support for dynamic task-tensor mapping based on downstream task performance.
 """
+
 
 # Configure logging
 logging.basicConfig(
@@ -72,6 +91,25 @@ def save_tensor_to_tempfile(tensor: torch.Tensor) -> str:
 
 def load_tensor_from_tempfile(tensor_path: str) -> torch.Tensor:
     return torch.load(tensor_path)
+
+
+def load_config(config_path: str) -> dict:
+    try:
+        with open(config_path, "r") as file:
+            return yaml.safe_load(file)
+    except Exception as e:
+        logger.error(f"Error loading config from {config_path}: {e}")
+        raise
+
+
+class _DummyLock:
+    """No-op lock for single-threaded mode"""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
 
 
 class DatabaseSchema:
@@ -1023,16 +1061,6 @@ class MergeReportManager:
             raise ValueError(f"Failed to set tensor {tensor_path}: {e}")
 
 
-def load_config(config_path: str) -> dict:
-    """Loads configuration from a YAML file."""
-    try:
-        with open(config_path, "r") as file:
-            return yaml.safe_load(file)
-    except Exception as e:
-        logger.error(f"Error loading config from {config_path}: {e}")
-        raise
-
-
 class TensorAnalyzer:
     """Analyzes tensors through multiple conceptual lenses with unified caching."""
 
@@ -1106,54 +1134,36 @@ class TensorAnalyzer:
     def _build_cache(self, tensor: torch.Tensor) -> dict:
         """Build optimized cache with preprocessed values for all metrics."""
         cache = {}
-
-        # Core tensor properties
         cache["tensor"] = tensor.to(self.device)
         cache["shape"] = tensor.shape
         cache["flat"] = cache["tensor"].flatten()
         cache["numel"] = cache["flat"].numel()
-
-        # Basic statistics
         cache["mean"] = torch.mean(cache["flat"])
         cache["std"] = torch.std(cache["flat"])
         cache["var"] = torch.var(cache["flat"])
-
-        # Sorted values and quantiles
         cache["sorted"] = torch.sort(cache["flat"])[0]
         q_vals = torch.tensor([0.25, 0.75], device=self.device)
         cache["quartiles"] = torch.quantile(cache["flat"], q_vals)
         cache["iqr"] = cache["quartiles"][1] - cache["quartiles"][0]
-
-        # Fluid dynamics properties
         cache["density"] = self._normalize_tensor(tensor)
         cache["gradients"] = torch.gradient(cache["density"])
         cache["velocity"] = torch.stack(cache["gradients"]).mean(0)
         cache["energy"] = 0.5 * (cache["density"].pow(2) + cache["velocity"].pow(2))
         cache["strain"] = torch.stack([g.abs() for g in cache["gradients"]]).mean(0)
-
-        # Spectral properties
         cache["svd"] = torch.linalg.svdvals(cache["tensor"])
         cache["rank"] = torch.linalg.matrix_rank(cache["tensor"])
         cache["norm"] = torch.linalg.norm(cache["tensor"])
-
-        # Statistical distributions
         cache["hist"] = self._compute_histogram(cache["flat"])
         cache["zero_mask"] = torch.abs(cache["tensor"]) < 1e-5
         cache["sparsity"] = cache["zero_mask"].float().mean()
-
-        # Additional properties
         cache["ranks"] = torch.argsort(cache["flat"].float()).argsort().float()
         cache["angles"] = torch.angle(cache["flat"][1:] + 1j * cache["flat"][:-1])
-
-        # Characteristic lengths for scale-dependent metrics
         if len(cache["shape"]) > 1:
             cache["characteristic_length"] = torch.prod(
                 torch.tensor(cache["shape"], dtype=torch.float32)
             ) ** (1.0 / len(cache["shape"]))
         else:
             cache["characteristic_length"] = float(cache["shape"][0])
-
-        # Pre-compute some expensive metrics
         cache["viscosity"] = float(1.0 / (1.0 + cache["strain"].mean()))
         cache["stability"] = float(
             1.0
@@ -1174,7 +1184,6 @@ class TensorAnalyzer:
         self,
         tensor: torch.Tensor,
         prev_tensor: Optional[torch.Tensor] = None,
-        metrics_subset: Optional[List[str]] = None,
     ) -> Dict[str, float]:
         """Unified tensor analysis through multiple conceptual frameworks."""
         # Update cache states
@@ -1184,19 +1193,10 @@ class TensorAnalyzer:
         if prev_tensor is not None:
             self.prev_cache = self._build_unified_cache(prev_tensor)
 
-        # Select which metrics to compute
-        if metrics_subset:
-            metrics_to_run = {
-                k: v for k, v in self.metrics.items() if k in metrics_subset
-            }
-        else:
-            metrics_to_run = self.metrics
-
-        # Calculate all metrics, using cached values when available
+        metrics_to_run = self.metrics
         results = {}
         for name, func in metrics_to_run.items():
             try:
-                # Check if we've pre-computed this in the cache
                 if hasattr(self.current_cache, name):
                     results[name] = getattr(self.current_cache, name)
                 else:
@@ -1205,7 +1205,6 @@ class TensorAnalyzer:
                 logger.error(f"Error calculating {name}: {e}")
                 results[name] = float("nan")
 
-        # Add temporal metrics if we have a previous state
         if self.prev_cache is not None:
             temporal_results = self._calc_temporal_metrics()
             results.update(temporal_results)
@@ -1380,7 +1379,6 @@ class TensorAnalyzer:
             pattern = flat[i : i + n]
             perm = torch.argsort(pattern)
             patterns.append(tuple(perm.tolist()))
-
         pattern_counts = Counter(patterns)
         probs = torch.tensor(
             [count / len(patterns) for count in pattern_counts.values()]
@@ -1587,13 +1585,11 @@ class TensorAnalyzer:
         flat = cache.density.flatten()
         angles_short = torch.angle(flat[1:] + 1j * flat[:-1])
         coherence_short = torch.abs(torch.exp(1j * angles_short).mean())
-
         if len(flat) > 100:
             stride = max(5, len(flat) // 50)
             angles_medium = torch.angle(flat[stride:] + 1j * flat[:-stride])
             coherence_medium = torch.abs(torch.exp(1j * angles_medium).mean())
             return float(0.7 * coherence_short + 0.3 * coherence_medium)
-
         return float(coherence_short)
 
     def _calc_stability(self, cache=None) -> float:
@@ -1602,7 +1598,6 @@ class TensorAnalyzer:
             cache = self.current_cache
             if cache.stability is not None:
                 return cache.stability
-
         velocity_mag = cache.velocity.abs()
         epsilon = max(1e-8, cache.tensor.abs().max() * 1e-5)
         return float(1.0 / (1.0 + velocity_mag.std() / (velocity_mag.mean() + epsilon)))
@@ -1674,15 +1669,9 @@ class TensorAnalyzer:
         x = self.current_cache["flat"]
         max_lag = min(100, len(x) // 4)  # Practical limit
         lags = range(2, max_lag)
-
-        # Calculate variance of differences at different lags
         tau = [torch.sqrt(torch.var(x[lag:] - x[:-lag])) for lag in lags]
-
-        # Estimate Hurst through power law relation
         m = torch.tensor([torch.log(t) for t in tau])
         x_vals = torch.tensor([torch.log(torch.tensor(float(lag))) for lag in lags])
-
-        # Linear regression slope = H (Hurst exponent)
         slope = (m.mean() * x_vals.mean() - (m * x_vals).mean()) / (
             x_vals.mean() ** 2 - (x_vals**2).mean()
         )
@@ -1702,21 +1691,15 @@ class TensorAnalyzer:
             math.log2(min_scale), math.log2(max_scale), log_steps, base=2
         ).int()
 
-        # Look at gradient distribution across scales
         alpha_min = float("inf")
         alpha_max = float("-inf")
         correlation_dims = []
         for scale in scales:
-            # Downsample gradients at this scale
             coarse_grads = [g[::scale] for g in gradients]
-            # Get distribution properties at this scale
             grad_mag = torch.stack([g.abs() for g in coarse_grads]).mean(0)
-            # Find local scaling exponent
             alpha = torch.log(grad_mag + 1e-8) / torch.log(torch.tensor(1.0 / scale))
-            # Update spectrum width
             alpha_min = min(alpha_min, float(alpha.min()))
             alpha_max = max(alpha_max, float(alpha.max()))
-            # Correlation dimension estimation
             pairs = torch.cdist(grad_mag.unsqueeze(0), grad_mag.unsqueeze(0)).flatten()
             below_threshold = (pairs < scale).float().mean()
             if below_threshold > 0:
@@ -1736,507 +1719,941 @@ class TensorAnalyzer:
 
 
 class SFTDataset(Dataset):
-    def __init__(self, sft_data_list):  # sft_data_list is your list of SFT dictionaries
+    def __init__(self, sft_data_list):
         self.sft_data = sft_data_list
 
     def __len__(self):
         return len(self.sft_data)
 
     def __getitem__(self, idx):
-        return self.sft_data[idx]  # Return the SFT dictionary directly
+        return self.sft_data[idx]
 
 
-class HyperdimensionalEncoder:
-    """Enhanced Hyperdimensional Computing encoder with full HDC operations.
+class HDCore:
+    """Core hyperdimensional computing engine with natural scaling properties"""
 
-    This implementation provides core HDC operations:
-    - Encoding text to high-dimensional binary vectors
-    - Vector similarity through cosine distance
-    - Binding operations (element-wise multiplication)
-    - Permutation for sequence encoding
-    - Cleanup memory for vector association
-    - Direct tensor mapping
-    """
+    def __init__(self, config):
+        self.dim = config.get("hdc_dim", 10000)
+        self.seed = config.get("random_seed", 42)
+        self.rng = np.random.default_rng(self.seed)
+        self._pos_vectors = self.create_orthogonal_set(
+            int(np.sqrt(self.dim))  # Natural scale - sqrt(dim) positions
+        )
+        self._base_vectors = self.create_orthogonal_set(
+            int(np.log2(self.dim))  # log2(dim) is the natural capacity
+        )
+        self._random_similarity_stats = []
 
-    def __init__(self, dimension=10000, seed=42, hash_trick=True):
-        np.random.seed(seed)
-        self.dimension = dimension
-        self.token_vectors = {}
-        self.hash_trick = hash_trick
-        self.norm_factor = np.sqrt(dimension)
+    def binarize(self, vector):
+        """Convert to {-1,1} binary representation"""
+        return np.sign(vector + 1e-10)
 
-    def get_vector(self, word):
-        """Get vector with hash trick option for unseen words"""
-        if word in self.token_vectors:
-            return self.token_vectors[word]
+    def create_random_vector(self):
+        """Create normalized random binary vector"""
+        return self.binarize(self.rng.normal(size=self.dim))
 
-        if self.hash_trick:
-            # Deterministic hash-based vector generation
-            word_hash = hash(word) % (2**32)
-            np.random.seed(word_hash)
-            vector = np.random.choice([-1, 1], size=(self.dimension,))
-            np.random.seed()  # Reset RNG state
-            return vector
+    def similarity(self, v1, v2):
+        """Normalized dot product similarity"""
+        sim = np.dot(v1, v2) / self.dim
+        if (
+            len(self._random_similarity_stats) < int(np.log2(self.dim))
+            and random.random() < 0.01
+        ):
+            self._random_similarity_stats.append(abs(sim))
+        return sim
+
+    def bind(self, v1, v2):
+        """Bind two vectors (element-wise multiplication)"""
+        return v1 * v2
+
+    def bundle(self, vectors, weights=None):
+        """Combine multiple vectors with optional weighting"""
+        if not vectors:
+            return np.zeros(self.dim)
+
+        if weights is None:
+            result = np.sum(vectors, axis=0)
         else:
-            vector = np.random.choice([-1, 1], size=(self.dimension,))
-            self.token_vectors[word] = vector
-            return vector
+            result = np.average(vectors, axis=0, weights=weights)
 
-    def encode_text(self, text, normalize=True):
-        """Encode text into HDC vector with optional normalization"""
-        words = text.lower().split()
-        if not words:
-            return np.zeros(self.dimension)
-
-        encoded_vector = np.zeros(self.dimension)
-        for word in words:
-            encoded_vector += self.get_vector(word)
-
-        result = np.sign(encoded_vector)
-
-        if normalize and len(words) > 0:
-            return result / self.norm_factor
-
-        return result
-
-    def similarity(self, vec1, vec2):
-        """Optimized cosine similarity"""
-        return np.dot(vec1, vec2)
-
-    def bind(self, vec1, vec2):
-        """Binding operation (element-wise multiplication)"""
-        return vec1 * vec2
+        return self.binarize(result)
 
     def permute(self, vector, shift=1):
-        """Circular permutation for sequence encoding"""
+        """Apply permutation for creating dissimilar vectors"""
         return np.roll(vector, shift)
 
-    def cleanup(self, vector, stored_vectors):
-        """Find closest matching known vector"""
-        if not stored_vectors:
-            return None
-        similarities = [(v, self.similarity(vector, v)) for v in stored_vectors]
-        return max(similarities, key=lambda x: x[1])[0]
+    def create_orthogonal_set(self, n):
+        """Create a set of approximately orthogonal vectors"""
+        base = self.create_random_vector()
+        return [self.permute(base, i * (self.dim // n)) for i in range(n)]
 
-    def project_to_tensor(self, hdc_vector, tensor_shape, projection_matrix=None):
-        """Project HDC vector to tensor space with optional cached projection"""
-        flat_size = np.prod(tensor_shape)
+    def position_encode(self, idx):
+        """Get position encoding vector - scales naturally with dimension"""
+        return self._pos_vectors[idx % len(self._pos_vectors)]
 
-        if projection_matrix is None:
-            # Create new projection matrix
-            projection_matrix = np.random.normal(
-                0, 1.0 / np.sqrt(self.dimension), (self.dimension, flat_size)
-            )
+    def hash_encode(self, data):
+        """Create stable vector from any hashable data - HDC primitive"""
+        data_hash = hash(str(data))
+        base_idx = data_hash % len(self._base_vectors)
+        base_vector = self._base_vectors[base_idx]
+        perm_levels = abs(data_hash) % int(np.log2(self.dim)) + 1
+        return self.permute(base_vector, perm_levels)
 
-        # Project HDC vector to tensor space
-        flat_field = np.matmul(hdc_vector, projection_matrix)
-        tensor_field = flat_field.reshape(tensor_shape)
+    def similarity_matrix(self, query, vectors):
+        """Efficiently compute similarities for multiple vectors"""
+        if len(query.shape) == 1:
+            query = query.reshape(1, -1)
+        return np.dot(vectors, query.T).flatten() / self.dim
 
-        # Normalize to unit length
-        tensor_norm = np.linalg.norm(tensor_field)
-        if tensor_norm > 0:
-            tensor_field = tensor_field / tensor_norm
+    def cleanup(self, noisy_vector, attractors):
+        """Clean up a noisy vector using HD attractors"""
+        similarities = self.similarity_matrix(noisy_vector, np.array(attractors))
+        best_idx = np.argmax(similarities)
+        return attractors[best_idx]
 
-        return tensor_field, projection_matrix
-
-    def create_item_memory(self, items):
-        """Create associative memory from list of items"""
-        memory = {}
-        for item in items:
-            vector = self.encode_text(item)
-            memory[item] = vector
-        return memory
-
-    def query_item_memory(self, query_text, memory, threshold=0.8):
-        """Query associative memory with text"""
-        query_vector = self.encode_text(query_text)
-        best_match = None
-        best_score = -1
-
-        for item, vector in memory.items():
-            score = self.similarity(query_vector, vector)
-            if score > best_score:
-                best_score = score
-                best_match = item
-
-        if best_score >= threshold:
-            return best_match, best_score
-        return None, best_score
-
-    def nary_bind(self, vectors):
-        """N-ary binding of multiple vectors"""
-        if not vectors:
-            return np.zeros(self.dimension)
-        result = vectors[0].copy()
-        for v in vectors[1:]:
-            result = self.bind(result, v)
-        return result
-
-    def create_tensor_mapping(self, model, important_tensors=None):
-        """Create HDC-to-tensor mapping for model"""
-        projection_matrices = {}
-
-        for name, tensor in model.named_parameters():
-            if important_tensors is None or name in important_tensors:
-                if hasattr(tensor, "shape"):
-                    projection_matrices[name] = np.random.normal(
-                        0,
-                        1.0 / np.sqrt(self.dimension),
-                        (self.dimension, np.prod(tensor.shape)),
-                    )
-
-        return projection_matrices
-
-    def map_concept_to_tensors(self, text, model, projection_matrices):
-        """Map text concept to tensor evolution fields"""
-        hdc_vector = self.encode_text(text)
-        tensor_fields = {}
-
-        for name, matrix in projection_matrices.items():
-            tensor = model.get_parameter(name)
-            if tensor is not None:
-                field, _ = self.project_to_tensor(hdc_vector, tensor.shape, matrix)
-                tensor_fields[name] = field
-
-        return tensor_fields
-
-    def update_projection(
-        self, projection_matrix, hdc_vector, tensor_flow, learning_rate=0.01
-    ):
-        """Update projection matrix based on successful tensor evolution"""
-        flat_flow = tensor_flow.flatten()
-        update = np.outer(hdc_vector, flat_flow) * learning_rate
-        return projection_matrix + update
+    def get_adaptive_threshold(self):
+        """Calculate similarity threshold based on HD dimension"""
+        if len(self._random_similarity_stats) >= int(np.log2(self.dim) / 2):
+            mean_sim = np.mean(self._random_similarity_stats)
+            return mean_sim + np.std(self._random_similarity_stats)
+        else:
+            return 0.5 * (1 + 1 / np.sqrt(self.dim))
 
 
-class HDCTensorNavigator:
-    """Navigate tensor space using HDC vectors."""
+class HDMemory:
+    """Hyperdimensional memory system riding the natural flows of HD space"""
 
-    def __init__(self, db_path, tensor_analyzer):
-        self.db_path = db_path
-        self.conn = sqlite3.connect(db_path)
-        self.tensor_analyzer = tensor_analyzer
-        self.hdc = HyperdimensionalEncoder(dimension=10000)
+    def __init__(self, hd_core, config):
+        self.hdc = hd_core
+        self.memory = {}
+        self.cache = {}
+        self.config = config
+        self.cache_size = self._resolve_auto_param("cache_size", self.hdc.dim)
+        if config.get("concurrency", "none") == "threadsafe":
+            from threading import RLock
 
-        # Create or load HDC-to-metric mapping
-        self.metric_mapping = self._build_metric_mapping()
+            self.lock = RLock()
+        else:
+            self.lock = _DummyLock()
+        self.stats_keeper = {
+            "lookups": 0,
+            "cache_hits": 0,
+            "similarities": deque(maxlen=int(np.sqrt(self.hdc.dim))),
+            "last_reset": time.time(),
+        }
 
-    def _build_metric_mapping(self):
-        """Build mapping between HDC space and tensor metric space."""
-        # Check if we have performance data to learn from
-        merge_reports = self._fetch_merge_reports()
+    def _resolve_auto_param(self, param_name, default_value):
+        """Resolve 'auto' config values to concrete numbers"""
+        value = self.config.get(param_name, "auto")
+        if value == "auto":
+            return default_value
+        return value
 
-        if not merge_reports:
-            return None
+    def encode(self, key, data):
+        """Encode anything to binary vector using natural HDC patterns"""
+        with self.lock:
+            if key in self.cache:
+                self.stats_keeper["cache_hits"] += 1
+                return self.cache[key]
+            self.stats_keeper["lookups"] += 1
+            if isinstance(data, (int, float)):
+                vector = self._encode_numeric(data)
+            elif isinstance(data, str):
+                vector = self._encode_text(data)
+            elif isinstance(data, dict):
+                vector = self._encode_dict(data)
+            elif isinstance(data, (list, tuple)):
+                vector = self._encode_sequence(data)
+            else:
+                vector = self.hdc.hash_encode(data)
+            self.memory[key] = vector
+            self._update_cache(key, vector)
+            return vector
 
-        # Extract samples of (hdc_vector, metrics, performance) for training
-        training_samples = []
+    def _encode_numeric(self, num):
+        """Encode numbers using logarithmic HD space mapping"""
+        if num == 0:
+            return self.hdc.hash_encode(0)
+        sign = 1 if num >= 0 else -1
+        log_val = np.log10(abs(num) + 1e-10)
+        magnitude = int(log_val)
+        precision = log_val - magnitude
+        sign_vec = (
+            self.hdc.create_random_vector()
+            if sign > 0
+            else -self.hdc.create_random_vector()
+        )
+        magnitude_vec = self.hdc.hash_encode(magnitude)
+        precision_vec = self.hdc.hash_encode(int(precision * self.hdc.dim))
 
-        for report in merge_reports:
-            # Get the task HDC vector
-            task_vector = self._get_task_vector(report["task"])
-            if task_vector is None:
-                continue
+        return self.hdc.bind(sign_vec, self.hdc.bind(magnitude_vec, precision_vec))
 
-            # Get tensor metrics for each tensor in the report
-            for tensor_source in report["tensor_sources"]:
-                tensor_path = tensor_source["tensor_path"]
-                source_model = tensor_source["source_model"]
-                performance = tensor_source.get("performance_delta", 0)
+    def _encode_text(self, text):
+        """Encode text using HD-native multi-scale features"""
+        if not text:
+            return np.zeros(self.hdc.dim)
 
-                # Get metrics for this tensor
-                metrics = self._get_tensor_metrics(source_model, tensor_path)
-                if metrics:
-                    training_samples.append(
-                        {
-                            "hdc_vector": task_vector,
-                            "metrics": metrics,
-                            "performance": performance,
-                        }
-                    )
+        if len(text) <= int(np.log2(self.hdc.dim)):
+            return self.hdc.hash_encode(text)
 
-        if not training_samples:
-            return None
+        vectors = []
+        words = text.lower().split()
 
-        # Train a simple linear mapping from HDC to metrics
-        # Concatenate all samples
-        hdc_matrix = np.vstack([s["hdc_vector"] for s in training_samples])
-        metrics_matrix = np.vstack(
-            [list(s["metrics"].values()) for s in training_samples]
+        for i, word in enumerate(words):
+            word_vec = self.hdc.hash_encode(word)
+            pos_vec = self.hdc.position_encode(i)
+            vectors.append(self.hdc.bind(word_vec, pos_vec))
+
+        n = max(2, min(5, int(np.log2(len(text)) / np.log2(self.hdc.dim / 10) + 2)))
+        for i in range(len(text) - n + 1):
+            ngram = text[i : i + n]
+            vectors.append(self.hdc.hash_encode(ngram))
+
+        return self.hdc.bundle(vectors)
+
+    def _encode_dict(self, data):
+        """Encode dictionary using natural information-weighted bundling"""
+        if not data:
+            return np.zeros(self.hdc.dim)
+
+        vectors = []
+        weights = []
+        for k, v in data.items():
+            key_vec = self.hdc.hash_encode(k)
+            val_key = f"{k}_{hash(str(v)) % self.hdc.dim}"
+            val_vec = self.encode(val_key, v)
+            pair_vec = self.hdc.bind(key_vec, val_vec)
+            vectors.append(pair_vec)
+            if isinstance(v, str):
+                weights.append(np.log1p(len(v)))
+            elif isinstance(v, dict):
+                weights.append(np.log1p(len(v)))
+            else:
+                weights.append(1.0)
+
+        if weights:
+            total = sum(weights)
+            if total > 0:
+                weights = [w / total for w in weights]
+            else:
+                weights = None
+        else:
+            weights = None
+
+        return self.hdc.bundle(vectors, weights)
+
+    def _encode_sequence(self, items):
+        """Encode sequence with pure information distribution weighting"""
+        if not items:
+            return np.zeros(self.hdc.dim)
+        if len(items) == 1:
+            return self.encode(f"item_{hash(str(items[0]))}", items[0])
+        item_ids = []
+        item_vectors = []
+        for i, item in enumerate(items):
+            item_id = hash(str(item))
+            item_ids.append(item_id)
+            item_key = f"seq_item_{item_id % self.hdc.dim}"
+            item_vec = self.encode(item_key, item)
+            pos_vec = self.hdc.position_encode(i)
+            item_vectors.append(self.hdc.bind(item_vec, pos_vec))
+        counter = Counter(item_ids)
+        total_items = len(items)
+        weights = [np.log(total_items / counter[item_id]) for item_id in item_ids]
+        total = sum(weights) or 1.0
+        weights = [w / total for w in weights]
+        return self.hdc.bundle(item_vectors, weights)
+
+    def _update_cache(self, key, vector):
+        """Cache management with dimension-scaled similarity eviction"""
+        if len(self.cache) >= self.cache_size:
+            evict_key = self._find_least_similar(vector)
+            del self.cache[evict_key]
+
+        self.cache[key] = vector
+
+    def _find_least_similar(self, vector):
+        """Find least similar vector with natural sampling rate"""
+        sample_ratio = np.sqrt(np.log2(self.hdc.dim) / self.hdc.dim)
+        sample_size = max(1, int(len(self.cache) * sample_ratio))
+        if sample_size < len(self.cache):
+            sample_keys = random.sample(list(self.cache.keys()), sample_size)
+        else:
+            sample_keys = list(self.cache.keys())
+        return min(
+            sample_keys,
+            key=lambda k: self.hdc.similarity(vector, self.cache[k]),
+            default=next(iter(self.cache)),
         )
 
-        # Use pseudoinverse for stable mapping
-        mapping = np.linalg.pinv(hdc_matrix) @ metrics_matrix
+    def batch_encode(self, items):
+        """Encode multiple items in one go"""
+        with self.lock:
+            results = {}
+            for key, data in items.items():
+                results[key] = self.encode(key, data)
+            return results
 
-        return mapping
+    def retrieve(self, key):
+        """Get vector from memory"""
+        return self.memory.get(key, np.zeros(self.hdc.dim))
 
-    def predict_optimal_tensors(self, task_description, available_models):
-        """Predict which tensors would work best for a given task."""
-        # Encode task
-        task_vector = self.hdc.encode_text(task_description)
+    def find_similar(self, query_vector, threshold=None, limit=None):
+        """Find similar vectors with dimension-appropriate approach"""
+        with self.lock:
+            limit = (
+                limit
+                if limit is not None
+                else self.config.get("result_limit", int(np.log2(self.hdc.dim)))
+            )
+            if threshold is None:
+                threshold = self.hdc.get_adaptive_threshold()
+                similarities = list(self.stats_keeper["similarities"])
+                if len(similarities) >= int(np.log2(self.hdc.dim)):
+                    sims = np.array(similarities)
+                    std_scale = np.log2(self.hdc.dim) / self.hdc.dim
+                    threshold = max(threshold, sims.mean() - std_scale * sims.std())
 
-        # If we have a learned mapping, use it to predict ideal metrics
-        if self.metric_mapping is not None:
-            predicted_metrics = task_vector @ self.metric_mapping
-        else:
-            # Fallback - search for similar tasks in our database
-            similar_task = self._find_similar_task(task_vector)
-            if similar_task:
-                predicted_metrics = self._get_ideal_metrics_for_task(similar_task)
+            if len(self.memory) > self.hdc.dim:
+                return self._find_similar_matrix(query_vector, threshold, limit)
             else:
-                return None
+                return self._find_similar_iterative(query_vector, threshold, limit)
 
-        # Find tensors that best match the predicted metrics
-        best_tensors = self._find_matching_tensors(predicted_metrics, available_models)
+    def _find_similar_matrix(self, query_vector, threshold, limit):
+        """Optimized matrix-based similarity search"""
+        keys = list(self.memory.keys())
+        vectors = np.array(list(self.memory.values()))
+        similarities = self.hdc.similarity_matrix(query_vector, vectors)
+        sample_size = int(np.log2(self.hdc.dim))
+        if len(similarities) > sample_size:
+            sample_idx = np.random.choice(len(similarities), sample_size, replace=False)
+            for idx in sample_idx:
+                self.stats_keeper["similarities"].append(similarities[idx])
+        else:
+            for sim in similarities:
+                self.stats_keeper["similarities"].append(sim)
+        mask = similarities >= threshold
+        matches = [(keys[i], float(similarities[i])) for i in np.where(mask)[0]]
+        matches.sort(key=lambda x: x[1], reverse=True)
 
-        return best_tensors
+        return matches[:limit]
 
+    def _find_similar_iterative(self, query_vector, threshold, limit):
+        """Classic iterative similarity for smaller memories"""
+        results = []
+        for key, vector in self.memory.items():
+            sim = self.hdc.similarity(query_vector, vector)
+            self.stats_keeper["similarities"].append(sim)
 
-class HDCTensorSignature:
-    """Unified HDC signature generation and storage for tensor metrics"""
+            if sim >= threshold:
+                results.append((key, sim))
 
-    def __init__(self, database: ModelDatabase, hdc_dim: int = 10000, seed: int = 42):
-        self.database = database
-        self.hdc_dim = hdc_dim
-        np.random.seed(seed)
-        # Single projection matrix for all signatures - this keeps signatures comparable
-        self.projection = np.random.normal(0, 1 / np.sqrt(hdc_dim), (hdc_dim, hdc_dim))
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results[:limit]
 
-    def generate_signature(self, tensor_id: str) -> str:
-        """Generate and store HDC signature from tensor metrics"""
-        try:
-            # Get all metrics for this tensor
-            metrics = self._fetch_metrics(tensor_id)
-            if not metrics:
-                raise ValueError(f"No metrics found for tensor {tensor_id}")
+    def clear_cache(self):
+        """Reset cache"""
+        with self.lock:
+            self.cache = {}
 
-            # Convert to normalized feature vector
-            feature_vec = np.array([metrics[name] for name in sorted(metrics.keys())])
-            feature_vec = (feature_vec - feature_vec.mean()) / (
-                feature_vec.std() + 1e-8
-            )
-
-            # Project to HDC space using our consistent projection matrix
-            hdc_vector = np.dot(feature_vec, self.projection[: len(feature_vec)])
-            signature = np.sign(hdc_vector)  # Binarize
-
-            # Store and return the signature ID
-            signature_id = str(uuid.uuid4())
-            self._store_signature(signature_id, tensor_id, signature)
-            return signature_id
-
-        except Exception as e:
-            logger.error(f"Failed to generate signature for tensor {tensor_id}: {e}")
-            raise
-
-    def _fetch_metrics(self, tensor_id: str) -> Dict[str, float]:
-        """Get tensor metrics from the database"""
-        try:
-            with self.database.conn as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    """
-                    SELECT metric_name, metric_value 
-                    FROM tensor_metrics
-                    WHERE tensor_id = ?
-                """,
-                    (tensor_id,),
-                )
-                return dict(cursor.fetchall())
-        except Exception as e:
-            logger.error(f"Failed to fetch metrics for tensor {tensor_id}: {e}")
-            raise
-
-    def _store_signature(
-        self, signature_id: str, tensor_id: str, signature: np.ndarray
-    ) -> None:
-        """Store HDC signature in the database"""
-        try:
-            with self.database.conn as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    """
-                    INSERT INTO hdc_signatures
-                    (signature_id, tensor_id, signature_components)
-                    VALUES (?, ?, ?)
-                """,
-                    (
-                        signature_id,
-                        tensor_id,
-                        json.dumps(
-                            signature.tolist()
-                        ),  # Store as JSON-serializable list
-                    ),
-                )
-        except Exception as e:
-            logger.error(
-                f"Failed to store signature {signature_id} for tensor {tensor_id}: {e}"
-            )
-            raise
-
-    def compare_signatures(self, sig_id1: str, sig_id2: str) -> float:
-        """Compare two signatures using Hamming similarity"""
-        try:
-            with self.database.conn as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    """
-                    SELECT signature_components 
-                    FROM hdc_signatures 
-                    WHERE signature_id IN (?, ?)
-                """,
-                    (sig_id1, sig_id2),
+    def stats(self):
+        """Get natural HDC statistics"""
+        with self.lock:
+            stats = {
+                "memory_size": len(self.memory),
+                "cache_size": len(self.cache),
+                "cache_ratio": len(self.cache) / max(1, len(self.memory)),
+                "cache_hit_ratio": self.stats_keeper["cache_hits"]
+                / max(1, self.stats_keeper["lookups"]),
+                "hd_dimension": self.hdc.dim,
+            }
+            similarities = list(self.stats_keeper["similarities"])
+            if similarities:
+                sims = np.array(similarities)
+                stats.update(
+                    {
+                        "sim_mean": float(sims.mean()),
+                        "sim_std": float(sims.std()),
+                        "sim_min": float(sims.min()),
+                        "sim_max": float(sims.max()),
+                    }
                 )
 
-                components = cursor.fetchall()
-                if len(components) != 2:
-                    raise ValueError("One or both signatures not found")
-
-                sig1 = np.array(json.loads(components[0][0]))
-                sig2 = np.array(json.loads(components[1][0]))
-                return float((sig1 == sig2).mean())  # Hamming similarity
-        except Exception as e:
-            logger.error(f"Error comparing signatures {sig_id1} and {sig_id2}: {e}")
-            raise
+            return stats
 
 
 class HDCDatasetEncoder:
-    """Process datasets, tasks, and concepts into HDC vectors and store in database."""
+    """Dataset encoding using HD-native patterns and memory management"""
 
-    def __init__(self, database: ModelDatabase, hdc_dim=10000):
+    def __init__(self, database, config):
         self.database = database
-        self.hdc_dim = hdc_dim
-        self.hdc = HyperdimensionalEncoder(dimension=hdc_dim)
+        self.config = config
+        self.hdc = HDCore(config)
+        self.memory = HDMemory(self.hdc, config)
+        self._subspaces = self.hdc.create_orthogonal_set(4)
+        self.subspace_map = {
+            "dataset": self._subspaces[0],
+            "task": self._subspaces[1],
+            "concept": self._subspaces[2],
+            "tensor": self._subspaces[3],
+        }
 
     def encode_sft_datasets(self):
-        """Process all SFT datasets and extract HDC encodings."""
+        """Process datasets using HD-native batch operations"""
         datasets = self._fetch_sft_datasets()
+        results = []
+        dataset_batch = {f"dataset_{d['name']}": d for d in datasets}
+        self.memory.batch_encode(dataset_batch)
         for dataset in datasets:
-            # Encode dataset characteristics into HDC vector
-            dataset_vector = self._encode_dataset(dataset)
-            dataset_id = self._store_vector(
-                "dataset", dataset["name"], dataset_vector, dataset
-            )
+            dataset_key = f"dataset_{dataset['name']}"
+            try:
+                dataset_vec = self.memory.retrieve(dataset_key)
+                subspace_vec = self.hdc.bind(dataset_vec, self.subspace_map["dataset"])
+                dataset_id = self._store_hd_entity(
+                    "dataset", dataset["name"], subspace_vec, dataset
+                )
+                task_count = self._process_elements(dataset, dataset_id, subspace_vec)
 
-            # Extract and encode tasks from the dataset
-            tasks = self._extract_tasks(dataset)
-            for task in tasks:
-                task_vector = self._encode_task(task)
-                task_id = self._store_vector("task", task["name"], task_vector, task)
-
-                # Store dataset-task relationship (similarity)
-                similarity = np.dot(dataset_vector, task_vector)
-                self._store_relation(dataset_id, task_id, "dataset_task", similarity)
-
-                # Extract concepts from tasks
-                concepts = self._extract_concepts(task)
-                for concept in concepts:
-                    concept_vector = self._encode_concept(concept)
-                    concept_id = self._store_vector(
-                        "concept", concept["name"], concept_vector, concept
-                    )
-
-                    # Store task-concept relationship (similarity)
-                    similarity = np.dot(task_vector, concept_vector)
-                    self._store_relation(
-                        task_id, concept_id, "task_concept", similarity
-                    )
-
-    def _encode_dataset(self, dataset: dict) -> np.ndarray:
-        """Encode dataset characteristics as HDC vector."""
-        # Combine multiple aspects of the dataset (e.g., description, samples, metadata)
-        encodings = []
-
-        # Encode dataset description
-        if "description" in dataset:
-            encodings.append(self.hdc.encode_text(dataset["description"]))
-
-        # Encode samples (using the first 100 samples)
-        if "samples" in dataset:
-            sample_text = " ".join([s["text"] for s in dataset["samples"][:100]])
-            encodings.append(self.hdc.encode_text(sample_text))
-
-        # Encode metadata (JSON serialized)
-        if "metadata" in dataset:
-            meta_str = json.dumps(dataset["metadata"])
-            encodings.append(self.hdc.encode_text(meta_str))
-
-        # Blend all encodings
-        if encodings:
-            combined = np.mean(encodings, axis=0)
-            return combined / np.linalg.norm(combined)
-        else:
-            # Fallback to name encoding if no other fields are present
-            return self.hdc.encode_text(dataset["name"])
-
-    def _encode_task(self, task: dict) -> np.ndarray:
-        """Encode task characteristics as HDC vector."""
-        task_text = task.get("text", "")
-        return self.hdc.encode_text(task_text)
-
-    def _encode_concept(self, concept: dict) -> np.ndarray:
-        """Encode concept characteristics as HDC vector."""
-        concept_text = concept.get("text", "")
-        return self.hdc.encode_text(concept_text)
-
-    def _fetch_sft_datasets(self) -> List[dict]:
-        """Fetch all SFT datasets from the database."""
-        with self.database.conn as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT dataset_id, name, description, samples, metadata FROM sft_datasets"
-            )
-            datasets = []
-            for row in cursor.fetchall():
-                datasets.append(
+                results.append(
                     {
-                        "dataset_id": row[0],
-                        "name": row[1],
-                        "description": row[2],
-                        "samples": json.loads(row[3]) if row[3] else [],
-                        "metadata": json.loads(row[4]) if row[4] else {},
+                        "dataset": dataset["name"],
+                        "dataset_id": dataset_id,
+                        "tasks_processed": task_count,
+                        "status": "success",
                     }
                 )
-            return datasets
+            except Exception as e:
+                results.append(
+                    {"dataset": dataset["name"], "error": str(e), "status": "failed"}
+                )
+        self.memory._flush_signatures()
+        return {
+            "processed_datasets": results,
+            "system_stats": self.memory.stats(),
+            "total_datasets": len(datasets),
+            "success_rate": len([r for r in results if r["status"] == "success"])
+            / len(datasets),
+        }
 
-    def _store_vector(
-        self, vector_type: str, name: str, vector: np.ndarray, metadata: dict
-    ) -> str:
-        """Store HDC vector in the database."""
-        vector_id = str(uuid.uuid4())
+    def _process_elements(self, dataset, dataset_id, dataset_vec):
+        """Process tasks and concepts using HD relationships"""
+        tasks = self._extract_tasks(dataset)
+        task_batch = {f"task_{t['name']}": t for t in tasks}
+        self.memory.batch_encode(task_batch)
 
-        with self.database.conn as conn:
-            conn.execute(
-                """
-                INSERT INTO hdc_vectors 
-                (vector_id, vector_type, name, description, vector_data, metadata_json)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    vector_id,
-                    vector_type,
-                    name,
-                    metadata.get("description") if metadata else None,
-                    vector.tobytes(),
-                    json.dumps(metadata) if metadata else None,
-                ),
+        for task in tasks:
+            task_key = f"task_{task['name']}"
+            task_vec = self.memory.retrieve(task_key)
+            task_subvec = self.hdc.bind(task_vec, self.subspace_map["task"])
+            task_id = self._store_hd_entity("task", task["name"], task_subvec, task)
+            self._store_hd_relation(
+                dataset_id,
+                task_id,
+                "contains_task",
+                self.hdc.similarity(dataset_vec, task_subvec),
             )
 
-        return vector_id
+            self._process_concepts(task, task_id, task_subvec)
 
-    def _store_relation(
-        self, source_id: str, target_id: str, relation_type: str, similarity: float
-    ) -> None:
-        """Store the relationship between two vectors in the database."""
+    def _process_concepts(self, task, task_id, task_vec):
+        """Process concepts using HD semantic patterns"""
+        concepts = self._extract_concepts(task)
+        concept_batch = {f"concept_{c['name']}": c for c in concepts}
+        self.memory.batch_encode(concept_batch)
+
+        for concept in concepts:
+            concept_key = f"concept_{concept['name']}"
+            concept_vec = self.memory.retrieve(concept_key)
+            concept_subvec = self.hdc.bind(concept_vec, self.subspace_map["concept"])
+            concept_id = self._store_hd_entity(
+                "concept", concept["name"], concept_subvec, concept
+            )
+            self._store_hd_relation(
+                task_id,
+                concept_id,
+                "uses_concept",
+                self.hdc.similarity(task_vec, concept_subvec),
+            )
+
+    def _extract_concepts(self, task):
+        """HD-native concept extraction using memory features"""
+        if not self.config.get("auto_extract_concepts", True):
+            return []
+
+        samples = task.get("samples", [])
+        concept_vectors = []
+        for sample in samples:
+            text = self._get_sample_text(sample)
+            if text:
+                vec = self.memory.encode(f"sample_{hash(text)}", text)
+                concept_vectors.append(vec)
+        if concept_vectors:
+            centroid = self.hdc.bundle(concept_vectors)
+            return self._cluster_concepts(centroid, concept_vectors)
+
+        return []
+
+    def _cluster_concepts(self, centroid, vectors):
+        """HD-native clustering using memory capabilities"""
+        concepts = []
+        threshold = self.hdc.get_adaptive_threshold()
+
+        for vec in vectors:
+            if self.hdc.similarity(centroid, vec) >= threshold:
+                concept_name = f"concept_{hash(tuple(vec))}"
+                concepts.append(
+                    {
+                        "name": concept_name,
+                        "description": "HD-clustered concept",
+                        "vector": vec,
+                    }
+                )
+
+        return concepts[: self.config.get("max_concepts", 10)]
+
+    def _store_hd_entity(self, etype, name, vector, metadata):
+        """Store using HD memory's native format"""
+        return self.memory.encode(
+            f"{etype}_{name}", {"vector": vector, "metadata": metadata}
+        )
+
+    def _store_hd_relation(self, source, target, rel_type, weight):
+        """Store relationship using memory's batch system"""
+        self.memory.encode(
+            f"rel_{source}_{target}",
+            {"source": source, "target": target, "type": rel_type, "weight": weight},
+        )
+
+    def _store_hd_entity(self, entity_type: str, name: str, metadata: dict) -> str:
+        """Store entities with full HD vector integration"""
+        vector = self.memory.encode(f"{entity_type}_{name}", metadata)
+        entity_id = str(uuid.uuid4())
         with self.database.conn as conn:
             conn.execute(
                 """
-                INSERT INTO hdc_relations
+                INSERT INTO hdc_entities 
+                (entity_id, entity_type, name, hdc_key, vector_snapshot)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    entity_id,
+                    entity_type,
+                    name,
+                    f"{entity_type}_{name}",
+                    vector.tobytes(),  # Store raw bytes for verification
+                ),
+            )
+        return entity_id
+
+    def _store_hd_relation(
+        self, source_id: str, target_id: str, rel_type: str, weight: float
+    ):
+        """Store relationships using HD binding patterns"""
+        source_vec = self.memory.retrieve(source_id)
+        target_vec = self.memory.retrieve(target_id)
+        rel_vec = self.hdc.bind(source_vec, target_vec)
+        rel_key = f"rel_{source_id}_{target_id}"
+        self.memory.encode(
+            rel_key, {"type": rel_type, "weight": weight, "vector": rel_vec}
+        )
+
+        with self.database.conn as conn:
+            conn.execute(
+                """
+                INSERT INTO hdc_relations 
                 (source_id, target_id, relation_type, similarity)
                 VALUES (?, ?, ?, ?)
                 """,
-                (source_id, target_id, relation_type, similarity),
+                (source_id, target_id, rel_type, weight),
             )
+
+    def find_similar_vectors(self, query_vector, **kwargs):
+        """Unified similarity search using HD memory"""
+        hd_results = self.memory.find_similar(query_vector, **kwargs)
+        with self.database.conn as conn:
+            cursor = conn.cursor()
+            return [self._get_entity_details(r[0], cursor) for r in hd_results]
+
+    def _get_entity_details(self, hd_key: str, cursor) -> dict:
+        """Get database metadata for HD memory results"""
+        cursor.execute(
+            "SELECT entity_id, entity_type, name FROM hdc_entities WHERE hdc_key = ?",
+            (hd_key,),
+        )
+        result = cursor.fetchone()
+        return {
+            "id": result[0],
+            "type": result[1],
+            "name": result[2],
+            "vector": self.memory.retrieve(hd_key),
+        }
+
+    def encode_prompt(self, prompt_text: str) -> np.ndarray:
+        """Leverage HD memory's text encoding directly"""
+        return self.memory.encode(f"prompt_{self._text_hash(prompt_text)}", prompt_text)
+
+    def encode_tensor_metrics(self, metrics: dict) -> np.ndarray:
+        """Use HD memory's dictionary encoding"""
+        return self.memory.encode(f"metrics_{self._metrics_hash(metrics)}", metrics)
+
+    def match_tensor_to_prompt(self, prompt_vector: np.ndarray, **kwargs) -> list:
+        """Subspace-optimized tensor matching"""
+        return self.memory.find_similar(
+            self.hdc.bind(prompt_vector, self.subspace_map["tensor"]),
+            subspace=self.subspace_map["tensor"],
+            **kwargs,
+        )
+
+    def _text_hash(self, text: str) -> int:
+        """Consistent hashing for text entities"""
+        return hash(text) % self.hdc.dim
+
+    def _metrics_hash(self, metrics: dict) -> int:
+        """Stable hash for metric dictionaries"""
+        ordered = json.dumps(metrics, sort_keys=True)
+        return hash(ordered) % self.hdc.dim
+
+
+class HDCTensorNavigator:
+    """Navigate tensor space using natural HDC properties"""
+
+    def __init__(self, database, hd_core, hd_memory, config):
+        self.database = database
+        self.hdc = hd_core
+        self.memory = hd_memory
+        self.config = config
+
+        # Use HDCore's native orthogonal set creation
+        base_count = int(np.log2(self.hdc.dim))  # Natural capacity
+        self.subspaces = dict(
+            zip(
+                ["performance", "architecture", "task", "metric"],
+                self.hdc.create_orthogonal_set(base_count)[:4],
+            )
+        )
+
+        # Memory-based metric mapping
+        self._init_mapping()
+
+    def _init_mapping(self):
+        """Initialize mapping directly from HD memory"""
+        # Check if we have stored mappings
+        mapping_key = "metric_task_mapping"
+        if mapping_key in self.memory.memory:
+            self.metric_mapping = self.memory.retrieve(mapping_key)
+        else:
+            # Bootstrap from merge report data
+            self.metric_mapping = self._build_mapping_from_reports()
+            self.memory.encode(mapping_key, self.metric_mapping)
+
+    def _build_mapping_from_reports(self):
+        """Build initial mapping from merge reports"""
+        reports = self._fetch_merge_reports()
+        if not reports:
+            # Create empty mapping that will learn over time
+            return {}
+
+        # Extract task-metric relationships
+        mappings = {}
+        for report in reports:
+            task_vec = self.memory.encode(
+                f"task_{hash(report['task'])}", report["task"]
+            )
+
+            for tensor in report.get("tensors", []):
+                metrics = tensor.get("metrics", {})
+                if not metrics:
+                    continue
+
+                # Encode metrics-to-task relationship
+                metrics_vec = self.memory.encode(
+                    f"metrics_{hash(str(metrics))}", metrics
+                )
+                performance = tensor.get("performance", 0.5)
+
+                # Use tensor name as key
+                tensor_name = tensor.get("name", "unknown")
+                if tensor_name not in mappings:
+                    # Initialize with task-performance binding
+                    mappings[tensor_name] = self.hdc.bind(
+                        task_vec,
+                        self.hdc.bind(
+                            metrics_vec, self.subspaces["performance"] * performance
+                        ),
+                    )
+                else:
+                    # Bundle with existing mapping
+                    mappings[tensor_name] = self.hdc.bundle(
+                        [
+                            mappings[tensor_name],
+                            self.hdc.bind(
+                                task_vec,
+                                self.hdc.bind(
+                                    metrics_vec,
+                                    self.subspaces["performance"] * performance,
+                                ),
+                            ),
+                        ]
+                    )
+
+        return mappings
+
+    def _fetch_merge_reports(self):
+        """Get merge reports from database"""
+        reports = []
+        with self.database.conn as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT report_id, base_model_name, creation_timestamp, metrics_json FROM merge_reports"
+            )
+
+            for row in cursor.fetchall():
+                report_id, model_name, timestamp, metrics = row
+                if metrics:
+                    try:
+                        metrics_data = json.loads(metrics)
+                        reports.append(
+                            {
+                                "report_id": report_id,
+                                "model": model_name,
+                                "timestamp": timestamp,
+                                "metrics": metrics_data,
+                                "task": f"optimize_{model_name}",  # Default task
+                            }
+                        )
+                    except json.JSONDecodeError as e:
+                        logger.error(
+                            f"Error decoding metrics for report {report_id}: {e}"
+                        )
+                        pass
+
+        return reports
+
+    def update_mapping(self, task, metrics, performance):
+        """Update mapping with new performance data"""
+        # Encode task and metrics
+        task_vec = self.memory.encode(f"task_{hash(task)}", task)
+        metrics_vec = self.memory.encode(f"metrics_{hash(str(metrics))}", metrics)
+
+        # Natural learning rate that scales with dimension
+        # Lower dimensions need faster learning, higher dims can be more stable
+        lr = self.config.get(
+            "mapping_lr", np.sqrt(np.log2(self.hdc.dim) / self.hdc.dim)
+        )
+
+        # Create performance binding
+        perf_binding = self.hdc.bind(
+            task_vec,
+            self.hdc.bind(metrics_vec, self.subspaces["performance"] * performance),
+        )
+
+        # Get metric key
+        metric_key = f"metrics_{hash(str(metrics))}"
+
+        # Update mapping
+        if metric_key in self.metric_mapping:
+            # Update existing mapping
+            current = self.metric_mapping[metric_key]
+            self.metric_mapping[metric_key] = self.hdc.bundle(
+                [current, perf_binding], weights=[1 - lr, lr]
+            )
+        else:
+            # New mapping
+            self.metric_mapping[metric_key] = perf_binding
+
+    def find_optimal_tensors(self, task, available_tensors, limit=None):
+        """Find optimal tensors for a task using HDC similarity"""
+        # Default to log2(dim) results - natural capacity
+        limit = limit or int(np.log2(self.hdc.dim))
+
+        # Encode task
+        task_vec = self.memory.encode(f"task_{hash(task)}", task)
+
+        # Get tensor signatures
+        tensor_sigs = {}
+        for tensor_id in available_tensors:
+            sig_key = f"tensor_sig_{tensor_id}"
+            if sig_key in self.memory.memory:
+                tensor_sigs[tensor_id] = self.memory.retrieve(sig_key)
+
+        # Find matches using native HDC similarity
+        matches = []
+        for tensor_id, sig in tensor_sigs.items():
+            # Bind with task to see compatibility
+            compatibility = self.hdc.similarity(
+                task_vec, self.hdc.bind(sig, self.subspaces["task"])
+            )
+            matches.append((tensor_id, compatibility))
+
+        # Sort by compatibility
+        matches.sort(key=lambda x: x[1], reverse=True)
+        return matches[:limit]
+
+    def predict_tensor_performance(self, task, tensor_metrics):
+        """Predict tensor performance on a task"""
+        # Encode task and metrics
+        task_vec = self.memory.encode(f"task_{hash(task)}", task)
+        metrics_vec = self.memory.encode(
+            f"metrics_{hash(str(tensor_metrics))}", tensor_metrics
+        )
+
+        # Check for direct match in mappings
+        metric_key = f"metrics_{hash(str(tensor_metrics))}"
+        if metric_key in self.metric_mapping:
+            # Extract performance through binding
+            mapping_vec = self.metric_mapping[metric_key]
+            similarity = self.hdc.similarity(
+                task_vec,
+                self.hdc.bind(
+                    mapping_vec, self.hdc.permute(self.subspaces["performance"])
+                ),
+            )
+
+            # Scale to [0,1] performance range
+            return (similarity + 1) / 2
+
+        # No direct match - use nearest neighbors
+        nearest_metrics = self._find_nearest_metrics(metrics_vec)
+        if not nearest_metrics:
+            return 0.5  # Default neutral performance
+
+        # Use weighted average of neighbor performances
+        total_weight = sum(w for _, w in nearest_metrics)
+        if total_weight == 0:
+            return 0.5
+
+        weighted_sum = sum(
+            self.predict_tensor_performance(task, m) * w for m, w in nearest_metrics
+        )
+
+        return weighted_sum / total_weight
+
+    def _find_nearest_metrics(self, metrics_vec, limit=3):
+        """Find nearest metric sets using HDC similarity"""
+        metric_keys = [
+            k for k in self.metric_mapping.keys() if k.startswith("metrics_")
+        ]
+        neighbors = []
+
+        for key in metric_keys:
+            mapping_vec = self.metric_mapping[key]
+            sim = self.hdc.similarity(metrics_vec, mapping_vec)
+            if sim > self.hdc.get_adaptive_threshold():
+                # Extract original metrics dict from memory
+                metric_dict = self.memory.retrieve(key)
+                neighbors.append((metric_dict, sim))
+
+        neighbors.sort(key=lambda x: x[1], reverse=True)
+        return neighbors[:limit]
+
+
+class HDCTensorSignature:
+    """Generate tensor signatures using pure HDC patterns"""
+
+    def __init__(self, database, hd_core, hd_memory, config):
+        self.database = database
+        self.hdc = hd_core
+        self.memory = hd_memory
+        self.config = config
+        self._tensor_buffer = []
+        self.buffer_size = int(np.sqrt(self.hdc.dim))  # Natural buffer size
+
+    def generate_signature(self, tensor_id, metrics):
+        """Create HDC signature from tensor metrics"""
+        metrics_vec = self.memory.encode(f"metrics_{tensor_id}", metrics)
+        sig_key = f"tensor_sig_{tensor_id}"
+        self.memory.encode(sig_key, metrics_vec)
+        self._buffer_signature(tensor_id, metrics_vec)
+        return metrics_vec
+
+    def generate_batch_signatures(self, tensor_metrics):
+        """Process multiple tensors at once"""
+        results = {}
+
+        for tensor_id, metrics in tensor_metrics.items():
+            metrics_key = f"metrics_{tensor_id}"
+            sig_key = f"tensor_sig_{tensor_id}"
+            metrics_vec = self.memory.encode(metrics_key, metrics)
+            self.memory.encode(sig_key, metrics_vec)
+            self._buffer_signature(tensor_id, metrics_vec)
+            results[tensor_id] = metrics_vec
+        return results
+
+    def _buffer_signature(self, tensor_id, signature):
+        """Buffer signature for batch database storage"""
+        self._tensor_buffer.append((tensor_id, signature.tobytes(), time.time()))
+        if len(self._tensor_buffer) >= self.buffer_size:
+            self._flush_signatures()
+
+    def _flush_signatures(self):
+        """Store buffered signatures in database"""
+        if not self._tensor_buffer:
+            return
+
+        with self.database.conn as conn:
+            cursor = conn.cursor()
+            cursor.executemany(
+                """
+                INSERT OR REPLACE INTO tensor_signatures
+                (tensor_id, signature, timestamp)
+                VALUES (?, ?, ?)
+                """,
+                self._tensor_buffer,
+            )
+
+        self._tensor_buffer = []
+
+    def compare_signatures(self, sig1, sig2):
+        """Compare two signatures using HDC similarity"""
+        similarity = float(self.hdc.similarity(sig1, sig2))
+        hamming_sim = float(np.mean(sig1 == sig2))
+        return {
+            "similarity": similarity,
+            "hamming": hamming_sim,
+            "combined": (similarity + hamming_sim) / 2,
+        }
+
+    def retrieve_signature(self, tensor_id):
+        """Get stored signature for a tensor"""
+        sig_key = f"tensor_sig_{tensor_id}"
+        if sig_key in self.memory.memory:
+            return self.memory.retrieve(sig_key)
+
+        with self.database.conn as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT signature FROM tensor_signatures WHERE tensor_id = ?",
+                (tensor_id,),
+            )
+
+            result = cursor.fetchone()
+            if result:
+                sig_bytes = result[0]
+                sig_vector = np.frombuffer(sig_bytes, dtype=np.int8)
+                self.memory.encode(sig_key, sig_vector)
+                return sig_vector
+
+        # Not found
+        return None
+
+    def find_similar_tensors(self, query_signature, threshold=None, limit=None):
+        """Find tensors with similar signatures"""
+        if threshold is None:
+            threshold = self.hdc.get_adaptive_threshold()
+
+        limit = limit or int(np.log2(self.hdc.dim))
+        sig_keys = [k for k in self.memory.memory.keys() if k.startswith("tensor_sig_")]
+        matches = []
+        for key in sig_keys:
+            sig = self.memory.retrieve(key)
+            sim = self.hdc.similarity(query_signature, sig)
+            if sim >= threshold:
+                tensor_id = key.replace("tensor_sig_", "")
+                matches.append((tensor_id, sim))
+
+        # Sort and limit
+        matches.sort(key=lambda x: x[1], reverse=True)
+        return matches[:limit]
 
 
 class ModelProcessor:
@@ -2335,6 +2752,488 @@ class ModelProcessor:
         return configs
 
 
+### -- ideas to integrate -- ###
+
+
+# Standard Q-Learning Baseline (unchanged)
+class QLearningAgent:
+    def __init__(
+        self,
+        state_size=10,
+        action_size=4,
+        learning_rate=0.1,
+        discount_factor=0.9,
+        exploration_prob=0.1,
+    ):
+        self.q_table = np.zeros((state_size, action_size))
+        self.learning_rate = learning_rate
+        self.discount_factor = discount_factor
+        self.exploration_prob = exploration_prob
+
+    def choose_action(self, state):
+        if random.uniform(0, 1) < self.exploration_prob:
+            return random.randint(0, self.q_table.shape[1] - 1)
+        return np.argmax(self.q_table[state])
+
+    def update_q_table(self, state, action, reward, next_state):
+        best_next_action = np.argmax(self.q_table[next_state])
+        self.q_table[state, action] += self.learning_rate * (
+            reward
+            + self.discount_factor * self.q_table[next_state, best_next_action]
+            - self.q_table[state, action]
+        )
+
+    def train(self, episodes=100):
+        performance_history = []
+        for episode in range(episodes):
+            state = random.randint(0, self.q_table.shape[0] - 1)
+            action = self.choose_action(state)
+            reward = random.uniform(0, 1)
+            next_state = random.randint(0, self.q_table.shape[0] - 1)
+            self.update_q_table(state, action, reward, next_state)
+            performance_history.append(reward)
+        return performance_history
+
+
+# Optimized Swarm Agent
+class SwarmAgent:
+    def __init__(self, id, queen, state_size=10, action_size=4, hd_dim=1000):
+        self.id = id
+        self.queen = queen
+        self.state_size = state_size
+        self.action_size = action_size
+
+        # Enhanced agent genetic traits
+        self.traits = {
+            "learning_rate": random.uniform(0.05, 0.5),
+            "discount_factor": random.uniform(0.7, 0.99),
+            "exploration_prob": random.uniform(0.05, 0.3),
+            "eligibility_trace": random.uniform(0, 0.3),
+            "reward_scaling": random.uniform(0.8, 1.2),
+        }
+
+        # HD memory for pattern recognition
+        self.hd_memory = HDMemory(dim=hd_dim)
+        self.state_vectors = {}  # Cache for encoded states
+
+        # Sparse representation of Q-values for memory efficiency
+        self.q_values = {}
+        self.performance = 0.5
+        self.memory = []
+        self.experience_count = 0
+
+    def encode_state(self, state):
+        # Get or create HD vector for this state
+        if state not in self.state_vectors:
+            self.state_vectors[state] = self.hd_memory.encode(f"state_{state}", state)
+        return self.state_vectors[state]
+
+    def choose_action(self, state):
+        state_key = f"s{state}"
+
+        # Initialize state entry if needed
+        if state_key not in self.q_values:
+            self.q_values[state_key] = np.random.uniform(0, 0.1, size=self.action_size)
+
+        # Dynamic exploration strategy based on experience
+        current_exploration = max(
+            0.05,
+            self.traits["exploration_prob"]
+            * (1.0 / (1.0 + 0.01 * self.experience_count)),
+        )
+
+        # Explore or exploit
+        if random.uniform(0, 1) < current_exploration:
+            return random.randint(0, self.action_size - 1)
+        return np.argmax(self.q_values[state_key])
+
+    def update_knowledge(self, state, action, reward, next_state, is_shared_exp=False):
+        state_key = f"s{state}"
+        next_state_key = f"s{next_state}"
+
+        # Apply individual reward scaling
+        scaled_reward = reward * self.traits["reward_scaling"]
+
+        # Initialize if needed
+        if state_key not in self.q_values:
+            self.q_values[state_key] = np.random.uniform(0, 0.1, size=self.action_size)
+        if next_state_key not in self.q_values:
+            self.q_values[next_state_key] = np.random.uniform(
+                0, 0.1, size=self.action_size
+            )
+
+        # Encode states with HD vectors for pattern recognition
+        state_vector = self.encode_state(state)
+        next_state_vector = self.encode_state(next_state)
+
+        # Similarity can influence learning
+        state_similarity = self.hd_memory.similarity(state_vector, next_state_vector)
+        similarity_factor = (
+            1.0 + 0.2 * (state_similarity + 1.0) / 2.0
+        )  # Range [1.0, 1.2]
+
+        # Adaptive learning rate based on whether experience is shared
+        effective_lr = self.traits["learning_rate"]
+        if is_shared_exp:
+            effective_lr *= 0.5  # Reduced learning from shared experiences
+
+        # Q-learning update with eligibility traces influence
+        best_next_value = np.max(self.q_values[next_state_key])
+        td_error = (
+            scaled_reward
+            + self.traits["discount_factor"] * best_next_value
+            - self.q_values[state_key][action]
+        )
+
+        # Apply eligibility trace effect to neighboring actions (simplified)
+        for a in range(self.action_size):
+            # Calculate action similarity - closer actions get more update
+            action_similarity = 1.0 - abs(a - action) / self.action_size
+            eligibility = self.traits["eligibility_trace"] * action_similarity
+
+            if a == action:
+                # Direct update for chosen action
+                self.q_values[state_key][a] += (
+                    effective_lr * td_error * similarity_factor
+                )
+            elif eligibility > 0.05:  # Skip tiny updates for efficiency
+                # Neighboring actions get smaller updates
+                self.q_values[state_key][a] += effective_lr * td_error * eligibility
+
+        # Update memory for performance tracking
+        if not is_shared_exp:  # Only track performance on own experiences
+            self.memory.append(scaled_reward)
+            if len(self.memory) > 10:  # Fixed small memory for efficiency
+                self.memory.pop(0)
+
+            # Update overall performance with recency bias
+            self.performance = 0.3 * self.performance + 0.7 * np.mean(self.memory)
+            self.experience_count += 1
+
+            # Adaptive exploration decay based on performance
+            if self.experience_count % 10 == 0:
+                self.traits["exploration_prob"] = max(
+                    0.05,  # Minimum exploration
+                    self.traits["exploration_prob"] * (1.0 - 0.01 * self.performance),
+                )
+
+    def mutate_traits(self, mutation_rate=0.1):
+        # Enhanced mutation with adaptive rates
+        for trait in self.traits:
+            if random.random() < mutation_rate:
+                if trait == "learning_rate":
+                    self.traits[trait] = max(
+                        0.01, min(0.5, self.traits[trait] + random.uniform(-0.1, 0.1))
+                    )
+                elif trait == "discount_factor":
+                    self.traits[trait] = max(
+                        0.5, min(0.99, self.traits[trait] + random.uniform(-0.1, 0.1))
+                    )
+                elif trait == "exploration_prob":
+                    self.traits[trait] = max(
+                        0.01, min(0.5, self.traits[trait] + random.uniform(-0.1, 0.1))
+                    )
+                elif trait == "eligibility_trace":
+                    self.traits[trait] = max(
+                        0, min(0.5, self.traits[trait] + random.uniform(-0.1, 0.1))
+                    )
+                elif trait == "reward_scaling":
+                    self.traits[trait] = max(
+                        0.5, min(1.5, self.traits[trait] + random.uniform(-0.2, 0.2))
+                    )
+
+
+# Optimized Swarm Queen
+class SwarmQueen:
+    def __init__(self, num_agents=10, state_size=10, action_size=4):
+        self.agents = [
+            SwarmAgent(i, self, state_size, action_size) for i in range(num_agents)
+        ]
+        self.state_size = state_size
+        self.action_size = action_size
+        self.elite_size = max(1, num_agents // 5)  # Top 20% are elite
+        self.generation = 0
+
+        # Track best agent traits for convergence analysis
+        self.best_traits_history = []
+
+    def select_parents(self):
+        # Tournament selection with diversity bonus
+        sorted_agents = sorted(self.agents, key=lambda a: a.performance, reverse=True)
+
+        # Calculate diversity metrics
+        diversity_scores = []
+        for agent in sorted_agents:
+            # Measure trait distance from average
+            avg_traits = {
+                t: np.mean([a.traits[t] for a in sorted_agents[: self.elite_size]])
+                for t in agent.traits
+            }
+
+            dist = sum(
+                abs(agent.traits[t] - avg_traits[t]) / avg_traits[t]
+                for t in agent.traits
+            )
+
+            diversity_scores.append(dist)
+
+        # Normalize diversity scores
+        if max(diversity_scores) > 0:
+            diversity_scores = [d / max(diversity_scores) for d in diversity_scores]
+
+        # Create weighted selection probabilities (performance + diversity)
+        performance_ranks = [1.0 / (i + 1) for i in range(len(sorted_agents))]
+        selection_weights = [
+            0.7 * p + 0.3 * d for p, d in zip(performance_ranks, diversity_scores)
+        ]
+
+        # Normalize weights to probabilities
+        total_weight = sum(selection_weights)
+        selection_probs = [w / total_weight for w in selection_weights]
+
+        # Select parents based on these probabilities
+        parent_indices = np.random.choice(
+            len(sorted_agents),
+            size=min(10, len(sorted_agents)),
+            p=selection_probs,
+            replace=False,
+        )
+
+        return [sorted_agents[i] for i in parent_indices]
+
+    def crossover(self, parent1, parent2):
+        # Create child agent
+        child = SwarmAgent(len(self.agents), self, self.state_size, self.action_size)
+
+        # Inherit traits with intelligent crossover
+        for trait in parent1.traits:
+            # Interpolation rather than binary selection
+            mix_ratio = random.random()
+            child.traits[trait] = (
+                mix_ratio * parent1.traits[trait]
+                + (1 - mix_ratio) * parent2.traits[trait]
+            )
+
+            # Add small random variation
+            child.traits[trait] += random.uniform(-0.05, 0.05)
+
+            # Ensure bounds
+            if trait == "learning_rate":
+                child.traits[trait] = max(0.01, min(0.5, child.traits[trait]))
+            elif trait == "discount_factor":
+                child.traits[trait] = max(0.5, min(0.99, child.traits[trait]))
+            elif trait == "exploration_prob":
+                child.traits[trait] = max(0.01, min(0.5, child.traits[trait]))
+            elif trait == "eligibility_trace":
+                child.traits[trait] = max(0, min(0.5, child.traits[trait]))
+            elif trait == "reward_scaling":
+                child.traits[trait] = max(0.5, min(1.5, child.traits[trait]))
+
+        # Knowledge transfer from parents - inherit some Q-values
+        # This is computationally expensive but very effective for learning
+        if random.random() < 0.5:  # 50% chance to transfer knowledge
+            for state_key in set(parent1.q_values.keys()).intersection(
+                parent2.q_values.keys()
+            ):
+                if len(child.q_values) < 20:  # Limit to prevent memory bloat
+                    # Weighted average favoring the better performing parent
+                    if parent1.performance > parent2.performance:
+                        weight1, weight2 = 0.7, 0.3
+                    else:
+                        weight1, weight2 = 0.3, 0.7
+
+                    child.q_values[state_key] = (
+                        weight1 * parent1.q_values[state_key]
+                        + weight2 * parent2.q_values[state_key]
+                    )
+
+        return child
+
+    def evolve_population(self):
+        # Track evolution progress
+        self.generation += 1
+
+        # Select parents
+        parents = self.select_parents()
+
+        # Preserve elites
+        sorted_agents = sorted(self.agents, key=lambda a: a.performance, reverse=True)
+        new_agents = []
+
+        # Direct elitism - keep top performers unchanged
+        elite_count = min(self.elite_size, len(sorted_agents))
+        new_agents.extend(sorted_agents[:elite_count])
+
+        # Track best agent traits
+        if elite_count > 0:
+            self.best_traits_history.append(sorted_agents[0].traits.copy())
+
+        # Generate offspring for the rest of the population
+        while len(new_agents) < len(self.agents):
+            # Select two parents
+            if len(parents) >= 2:
+                parent1, parent2 = random.sample(parents, k=2)
+
+                # Create offspring
+                child = self.crossover(parent1, parent2)
+
+                # Mutation rate increases as generations progress to avoid premature convergence
+                adaptive_mutation_rate = 0.1 + 0.05 * min(1.0, self.generation / 20)
+                child.mutate_traits(mutation_rate=adaptive_mutation_rate)
+
+                new_agents.append(child)
+            else:
+                # If not enough parents, create a random agent
+                new_agent = SwarmAgent(
+                    len(new_agents), self, self.state_size, self.action_size
+                )
+                new_agents.append(new_agent)
+
+        # Update IDs and transfer population
+        for i, agent in enumerate(new_agents):
+            agent.id = i
+
+        self.agents = new_agents
+
+    def run_evaluation_cycle(self):
+        # Create shared experience buffer
+        shared_experiences = []
+
+        # Evaluate all agents
+        for agent in self.agents:
+            agent_experiences = []
+
+            # Each agent tries multiple tasks
+            for _ in range(5):  # 5 evaluations per cycle for statistical stability
+                state = random.randint(0, self.state_size - 1)
+                action = agent.choose_action(state)
+
+                # Enhanced reward function that creates better learning signal
+                base_reward = random.uniform(0, 1)
+
+                # Action-state matching component
+                action_match = 1.0 - 0.3 * abs(
+                    (action / self.action_size) - (state / self.state_size)
+                )
+
+                # Progressive difficulty based on agent performance
+                difficulty_factor = 1.0 + 0.3 * (agent.performance)
+
+                # Final reward calculation
+                reward = (base_reward * action_match) / difficulty_factor
+
+                # State transition model with some stochasticity
+                next_state = (state + action + random.randint(-1, 1)) % self.state_size
+
+                # Store experience
+                agent_experiences.append((state, action, reward, next_state))
+
+                # Agent learns from its own experience
+                agent.update_knowledge(state, action, reward, next_state)
+
+            # Add best experience to shared pool
+            if agent_experiences:
+                best_exp = max(
+                    agent_experiences, key=lambda x: x[2]
+                )  # Select by reward
+                shared_experiences.append(best_exp)
+
+        # Experience sharing among elite agents
+        if shared_experiences:
+            elite_agents = sorted(
+                self.agents, key=lambda a: a.performance, reverse=True
+            )[: self.elite_size]
+
+            # Each elite agent learns from 2 random shared experiences
+            for agent in elite_agents:
+                for _ in range(min(2, len(shared_experiences))):
+                    exp = random.choice(shared_experiences)
+                    state, action, reward, next_state = exp
+                    # Learn from shared experience with reduced weight
+                    agent.update_knowledge(
+                        state, action, reward, next_state, is_shared_exp=True
+                    )
+
+        # Return average and best performance
+        performances = [agent.performance for agent in self.agents]
+        return np.mean(performances), max(performances) if performances else 0
+
+    def run_evolution_cycle(self, cycles_per_generation=3):
+        # Run multiple evaluation cycles
+        cycle_avg_performances = []
+        cycle_best_performances = []
+
+        for _ in range(cycles_per_generation):
+            avg_perf, best_perf = self.run_evaluation_cycle()
+            cycle_avg_performances.append(avg_perf)
+            cycle_best_performances.append(best_perf)
+
+        # Evolve population
+        self.evolve_population()
+
+        return np.mean(cycle_avg_performances), np.mean(cycle_best_performances)
+
+
+# Optimized Evolutionary Reinforcement Learning Framework
+class ERLFramework:
+    def __init__(self, state_size=10, action_size=4, num_agents=10):
+        self.swarm_queen = SwarmQueen(
+            num_agents=num_agents, state_size=state_size, action_size=action_size
+        )
+        self.avg_performance_history = []
+        self.best_performance_history = []
+        self.population_size_history = []
+
+    def train(self, iterations=50, cycles_per_generation=3):
+        for i in range(iterations):
+            # Adaptive cycles - more evaluation as training progresses
+            adaptive_cycles = cycles_per_generation
+            if i > iterations // 2:
+                adaptive_cycles += 1  # One more cycle in latter half of training
+
+            # Run evolution cycle
+            avg_performance, best_performance = self.swarm_queen.run_evolution_cycle(
+                adaptive_cycles
+            )
+
+            # Track histories
+            self.avg_performance_history.append(avg_performance)
+            self.best_performance_history.append(best_performance)
+            self.population_size_history.append(len(self.swarm_queen.agents))
+
+            # Dynamic population adjustments (every 10 iterations)
+            if i > 0 and i % 10 == 0 and i < iterations - 10:
+                # Check if performance has plateaued
+                recent_best = self.best_performance_history[-5:]
+                if (
+                    max(recent_best) - min(recent_best) < 0.05
+                ):  # Small variance indicates plateau
+                    # Add new agents with traits similar to best agent but more diverse
+                    best_agent = max(
+                        self.swarm_queen.agents, key=lambda a: a.performance
+                    )
+
+                    # Add 2 new agents with traits influenced by best agent
+                    for _ in range(2):
+                        new_agent = SwarmAgent(
+                            len(self.swarm_queen.agents),
+                            self.swarm_queen,
+                            self.swarm_queen.state_size,
+                            self.swarm_queen.action_size,
+                        )
+
+                        # Copy and mutate best agent's traits with higher mutation
+                        for trait in best_agent.traits:
+                            mutation = random.uniform(-0.2, 0.2)
+                            new_agent.traits[trait] = max(
+                                0.01, min(0.99, best_agent.traits[trait] + mutation)
+                            )
+
+                        self.swarm_queen.agents.append(new_agent)
+
+        return self.avg_performance_history, self.best_performance_history
+
+
 @torch.inference_mode()
 def main(config_path: str):
     """Main function to run the model analysis process."""
@@ -2366,7 +3265,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config",
         type=str,
-        default="mastermerge_config.yaml",
+        default="olm_config.yaml",
         help="Path to configuration file",
     )
     args = parser.parse_args()
