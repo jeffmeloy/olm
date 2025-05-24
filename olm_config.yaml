@@ -10,7 +10,7 @@ es_swap: true
 es_generations: 1
 es_sigma: 0.5 
 skip_norm: true
-base_select: "jeffmeloy/Qwen2.5-7B-olm-v1.14"
+base_select: # add base model or leave blank
 boundary_select: false
 load_merge_report: false
 improve_all: # "quality" "bigram", "exact", "all", "base", or blank (use elitism)
@@ -18,14 +18,13 @@ samples: 300 # (tbd) implement code to process this for number of dataset sample
 base_model_name: 
 models: # uncomment the models to merge
 ## Qwen2.5 7B Models ##
-- "jeffmeloy/Qwen2.5-7B-olm-v1.14"
-#- "AIDC-AI/Marco-o1"
-#- "AlekseyKorshuk/ai-detection-gutenberg-human-v2-formatted-ai-sft-qwen-7b-sft-3epochs"
-#- "allura-org/Teleut-7b"
-#- "AmberYifan/Qwen2.5-7B-dpo-2k"
-#- "AmberYifan/Qwen2.5-7B-dpo-2k-hhrlhf"
-#- "Aashraf995/Qwen-Evo-7B"
-#- "Azure99/Blossom-V6-7B"
+- "AIDC-AI/Marco-o1"
+- "AlekseyKorshuk/ai-detection-gutenberg-human-v2-formatted-ai-sft-qwen-7b-sft-3epochs"
+- "allura-org/Teleut-7b"
+- "AmberYifan/Qwen2.5-7B-dpo-2k"
+- "AmberYifan/Qwen2.5-7B-dpo-2k-hhrlhf"
+- "Aashraf995/Qwen-Evo-7B"
+- "Azure99/Blossom-V6-7B"
 #- "Ba2han/Qwen-2.5-7B-Woonderer-0.1"
 #- "beomi/Qwen2.5-7B-Instruct-kowiki-qa"
 #- "bespokelabs/Bespoke-Stratos-7B"
@@ -121,8 +120,8 @@ models: # uncomment the models to merge
 #- "ZHIYII/Qwen2.5-7B-Reward"
 
 dataset:
-#  "ifeval_sharegpt.json":
-#    mode: "uncertain_bigram" 
+  "ifeval_sharegpt.json":
+    mode: "uncertain_bigram" 
 #  "bbh_sharegpt.json":
 #    mode: "exact_uncertain"
 #  "qpqa_sharegpt.json":
