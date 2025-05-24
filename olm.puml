@@ -1,0 +1,144 @@
+@startuml OLM
+title Optimal Layer Merging (OLM) with ES Fine-Tuning
+
+|Configuration|
+start
+:Load YAML Config;
+note right
+  Core config params:
+  - models_dir
+  - output_dir
+  - model_pool
+  - datasets
+  - optimization strategies
+  - ES parameters (sigma, generations)
+endnote
+
+|Model Preparation|
+:Download Required Models;
+note right
+  Batch download all models
+  from Hugging Face
+endnote
+
+:Select/Validate Base Model;
+note right
+  Either:
+  - Use provided base model
+  - Dynamically select via
+    performance ranking
+endnote
+
+:Build Evaluation Cache;
+note right
+  Pre-tokenize context/responses
+  for faster evaluations
+endnote
+
+|Base Model Setup|
+:Load Base Model & Tokenizer;
+note right
+  CPU-based loading
+  bfloat16 precision
+endnote
+
+:Compute Base Metrics;
+note right
+  Baseline performance
+  across all datasets.
+  Save to initial merge_report.json
+endnote
+
+|Optimization Phases|
+partition "Boundary Layer Optimization" {
+  if (boundary_select enabled?) then (yes)
+    :Optimize Boundary Components;
+    note right
+      - Select best model for
+        (embed_tokens, model.norm, lm_head)
+        based on rank sum.
+      - Apply components to working model.
+      - Update merge_report.json
+    endnote
+  else (no)
+  endif
+}
+
+partition "Layer-wise Optimization" {
+  if (layer_swap enabled?) then (yes)
+    :Iterate Through All Layers;
+
+    while (Layers Remaining) is (yes)
+      :For each candidate model in pool:;
+      note right
+        - Temporarily swap current layer
+          from candidate into working model.
+        - Evaluate on all datasets.
+        - Store metrics.
+      endnote
+      :Permanently Update Model with Best Layer;
+      note right
+        Select Lowest Aggragate Rank
+      endnote
+      :Save Layer State & Update Merge Report;
+    endwhile
+  else (no)
+  endif
+}
+
+partition "Tensor-wise Optimization" {
+  if (tensor_swap enabled?) then (yes)
+    :Iterate Through All Tensors;
+
+    while (Tensors Remaining) is (yes)
+      :For each candidate model in pool:;
+      note right
+        - Temporarily swap current tensor
+          from candidate into working model.
+        - Evaluate on all datasets.
+        - Store metrics.
+      endnote
+      :Permanently Update Model with Best Tensor;
+      note right
+        Select Lowest Aggragate Rank
+      endnote
+
+      partition "(1+λ)-ES Fine-Tuning" {
+        :Compute Tensor SVD and λ;
+        note right
+          λ = max(4, int(4 + 3 * math.log(dim_svd)))
+        endnote
+        : Iterate Through All Generations;
+
+
+        while (Generations Remaining) is (yes)
+          :Generate λ Offspring Tensors;
+          note right
+            Perturb singular values (S_svd)
+          endnote
+          :Evaluate each Offspring;
+          note right
+            - Temporarily swap current offspring
+              tensor into working model.
+            - Evaluate on all datasets.
+            - Store metrics.
+          endnote
+          :Select Best Offspring;
+          note right
+            Select Lowest Aggragate Rank
+          endnote
+          :Update Model with Best Offspring;
+        endwhile
+      }
+
+      :Save Tensor State & Update Merge Report;
+    endwhile
+  else (no)
+  endif
+}
+
+|Finalization|
+:Save Final Optimized Model;
+:Generate/Finalize Comprehensive Merge Report;
+stop
+@enduml

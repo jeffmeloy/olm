@@ -1,101 +1,103 @@
 direction: "backward"  # "backward" or "forward"
-models_dir: "./input_models/"
-output_dir: "./merged_model/"
+models_dir: "E:/input_models/"
+output_dir: "D:/merged_model/"
 metric_dir: "./metrics/"
 dataset_dir: "./benchmarks/"
 db_dir:  # either blank or a directory path to store and retreive from a sqlite db
-skip_quality: false
-layer_swap: true
+layer_swap: false
 tensor_swap: true
-skip_norm: false
-base_select: true 
-boundary_select: true
+es_swap: true
+es_generations: 1
+es_sigma: 0.5 
+skip_norm: true
+base_select: "jeffmeloy/Qwen2.5-7B-olm-v1.14"
+boundary_select: false
 load_merge_report: false
-improve_all: "base" # "quality" "bigram", "exact", "all", "base", or blank
-samples: 200 # (tbd) implement code to process this for number of dataset samples to evaluate 
+improve_all: # "quality" "bigram", "exact", "all", "base", or blank (use elitism)
+samples: 300 # (tbd) implement code to process this for number of dataset samples to evaluate 
 base_model_name: 
-models_db: # if blank use only file system files. if true then use sqlite db to store composite model layer composition info and corresponding dataset metrics
-
-models: # uncomment the models you want to merge
+models: # uncomment the models to merge
 ## Qwen2.5 7B Models ##
-- "AIDC-AI/Marco-o1"
-- "AlekseyKorshuk/ai-detection-gutenberg-human-v2-formatted-ai-sft-qwen-7b-sft-3epochs"
-- "allura-org/Teleut-7b"
-- "AmberYifan/Qwen2.5-7B-dpo-2k"
-- "AmberYifan/Qwen2.5-7B-dpo-2k-hhrlhf"
-- "Aashraf995/Qwen-Evo-7B"
-- "Azure99/Blossom-V6-7B"
-- "Ba2han/Qwen-2.5-7B-Woonderer-0.1"
-- "beomi/Qwen2.5-7B-Instruct-kowiki-qa"
-- "bespokelabs/Bespoke-Stratos-7B"
-- "brahmairesearch/x1-7B-v0.1"
-- "bugatt/BGLLM"
-- "Bui1dMySea/LongRAG-Qwen2.5-7B-Instruct"
-- "bunnycore/Qandora-2.5-7B"
-- "cooperleong00/Qwen2.5-7B-Instruct-Jailbroken"
-- "DeepGlint-AI/llava-mlcd-qwen2.5-7b"
-- "DrNicefellow/Qwen2.5-7B-O1-Journey-1"
-- "edgerunner-ai/EdgeRunner-Command-Nested"
-- "EVA-UNIT-01/EVA-Qwen2.5-7B-v0.1"
-- "fblgit/cybertron-v4-qw7B-UNAMGS"
-- "FourOhFour/Vapor_v2_7B"
-- "FreedomIntelligence/BlenderLLM"
-- "FreedomIntelligence/HuatuoGPT-o1-7B"
-- "Goekdeniz-Guelmez/Josiefied-Qwen2.5-7B-Instruct-abliterated-v2"
-- "happzy2633/qwen2.5-7b-ins-v3"
-- "Henry94/Qwen2.5-7B-Character"
-- "hotmailuser/QwenSlerp-7B"
-- "huihui-ai/Qwen2.5-7B-Instruct-abliterated-v2"
-- "HumanLLMs/Human-Like-Qwen2.5-7B-Instruct"
-- "internlm/OREAL-7B-SFT"
-- "internlm/SWE-Fixer-Retriever-7B"
-- "jbjeong91/Qwen2.5_7B_IST_StoryGen_test2"
-- "katanemo/Arch-Function-7B"
-- "Manual-Dataset-Creation-Project/Take-7B"
-- "Manual-Dataset-Creation-Project/Matsu-7B"
-- "Marsouuu/lareneg3Bv2-ECE-PRYMMAL-Martial"
-- "mlfoundations-dev/Bespoke-Stratos-17k-v3"
-- "mlfoundations-dev/hp_ablations_qwen_epoch2"
-- "neopolita/jessi-v0.1-qwen2.5-7b-instruct"
-- "newsbang/Homer-v0.5-Qwen2.5-7B"
-- "nextvalueup/Qwen2.5-7B-Instruct_v3"
-- "nguyentd/FinancialAdvice-Qwen2.5-7B"
-- "nhyha/merge_Qwen2.5-7B-Instruct_20241023_0314"
-- "opencompass/CompassJudger-1-7B-Instruct"
-- "Orion-zhen/Meissa-Qwen2.5-7B-Instruct"
-- "Orion-zhen/Qwen2.5-7B-Gutenberg-KTO"
-- "Orion-zhen/Qwen2.5-7B-Instruct-Uncensored"
-- "qingy2024/UwU-7B-Instruct"
-- "Qwen/Qwen2.5-7B"
-- "Qwen/Qwen2.5-7B-Instruct"
-- "qfq/Qwen2.5-7B-Instruct-20241128-215054"
-- "rombodawg/Rombos-LLM-V2.5-Qwen-7b"
-- "prithivMLmods/Deepthink-Reasoning-7B"
-- "prithivMLmods/Novaeus-Promptist-7B-Instruct"
-- "prithivMLmods/QwQ-MathOct-7B"
-- "scilo/qwen_ft_no_temp"
-- "sethuiyer/Qwen2.5-7B-Anvita"
-- "Siheng99/Qwen2.5-7B-Instruct-SEALONG"
-- "SJTULean/LeanFormalizer_CoT"
-- "SJTULean/LeanFormalizer_PPO"
-- "SJTULean/LeanFormalizer_SFT"
-- "sometimesanotion/KytheraMix-7B-v0.2"
-- "Spestly/Athena-1-7B"
-- "suayptalha/HomerCreativeAnvita-Mix-Qw7B"
-- "tablegpt/TableGPT2-7B"
-- "TIGER-Lab/ScholarCopilot-v1"
-- "thomas-yanxin/XinYuan-Qwen2.5-7B-0917"
-- "Tsunami-th/Tsunami-1.0-7B-Instruct"
-- "tugstugi/Qwen2.5-7B-Instruct-QwQ-v0.1"
-- "win10/Verdandi-Qwen2.5-7B"
-- "winstcha/rewrite-7B-INT4"
-- "Xiaojian9992024/Qwen2.5-THREADRIPPER-Small"
-- "xwen-team/Xwen-7B-Chat"
-- "yellowtown/7B-v0.2"
-- "ZeroXClem/Qwen2.5-7B-HomerAnvita-NerdMix"
-- "ZeroXClem/Qwen2.5-7B-HomerCreative-Mix"
+- "jeffmeloy/Qwen2.5-7B-olm-v1.14"
+#- "AIDC-AI/Marco-o1"
+#- "AlekseyKorshuk/ai-detection-gutenberg-human-v2-formatted-ai-sft-qwen-7b-sft-3epochs"
+#- "allura-org/Teleut-7b"
+#- "AmberYifan/Qwen2.5-7B-dpo-2k"
+#- "AmberYifan/Qwen2.5-7B-dpo-2k-hhrlhf"
+#- "Aashraf995/Qwen-Evo-7B"
+#- "Azure99/Blossom-V6-7B"
+#- "Ba2han/Qwen-2.5-7B-Woonderer-0.1"
+#- "beomi/Qwen2.5-7B-Instruct-kowiki-qa"
+#- "bespokelabs/Bespoke-Stratos-7B"
+#- "brahmairesearch/x1-7B-v0.1"
+#- "bugatt/BGLLM"
+#- "Bui1dMySea/LongRAG-Qwen2.5-7B-Instruct"
+#- "bunnycore/Qandora-2.5-7B"
+#- "cooperleong00/Qwen2.5-7B-Instruct-Jailbroken"
+#- "DeepGlint-AI/llava-mlcd-qwen2.5-7b"
+#- "DrNicefellow/Qwen2.5-7B-O1-Journey-1"
+#- "edgerunner-ai/EdgeRunner-Command-Nested"
+#- "EVA-UNIT-01/EVA-Qwen2.5-7B-v0.1"
+#- "fblgit/cybertron-v4-qw7B-UNAMGS"
+#- "FourOhFour/Vapor_v2_7B"
+#- "FreedomIntelligence/BlenderLLM"
+#- "FreedomIntelligence/HuatuoGPT-o1-7B"
+#- "Goekdeniz-Guelmez/Josiefied-Qwen2.5-7B-Instruct-abliterated-v2"
+#- "gz987/qwen2.5-7b-cabs-v0.3"
+#- "happzy2633/qwen2.5-7b-ins-v3"
+#- "Henry94/Qwen2.5-7B-Character"
+#- "hotmailuser/QwenSlerp-7B"
+#- "huihui-ai/Qwen2.5-7B-Instruct-abliterated-v2" 
+#- "HumanLLMs/Human-Like-Qwen2.5-7B-Instruct"
+#- "internlm/OREAL-7B-SFT"
+#- "internlm/SWE-Fixer-Retriever-7B"
+#- "jbjeong91/Qwen2.5_7B_IST_StoryGen_test2"
+#- "katanemo/Arch-Function-7B"
+#- "Manual-Dataset-Creation-Project/Take-7B"
+#- "Manual-Dataset-Creation-Project/Matsu-7B"
+#- "Marsouuu/lareneg3Bv2-ECE-PRYMMAL-Martial"
+#- "mlfoundations-dev/Bespoke-Stratos-17k-v3"
+#- "mlfoundations-dev/hp_ablations_qwen_epoch2"
+#- "neopolita/jessi-v0.1-qwen2.5-7b-instruct"
+#- "newsbang/Homer-v0.5-Qwen2.5-7B"
+#- "nextvalueup/Qwen2.5-7B-Instruct_v3"
+#- "nguyentd/FinancialAdvice-Qwen2.5-7B"
+#- "nhyha/merge_Qwen2.5-7B-Instruct_20241023_0314"
+#- "opencompass/CompassJudger-1-7B-Instruct"
+#- "Orion-zhen/Meissa-Qwen2.5-7B-Instruct"
+#- "Orion-zhen/Qwen2.5-7B-Gutenberg-KTO"
+#- "Orion-zhen/Qwen2.5-7B-Instruct-Uncensored"
+#- "qingy2024/UwU-7B-Instruct"
+#- "Qwen/Qwen2.5-7B"
+#- "Qwen/Qwen2.5-7B-Instruct"
+#- "qfq/Qwen2.5-7B-Instruct-20241128-215054"
+#- "rombodawg/Rombos-LLM-V2.5-Qwen-7b"
+#- "prithivMLmods/Deepthink-Reasoning-7B"
+#- "prithivMLmods/Novaeus-Promptist-7B-Instruct"
+#- "prithivMLmods/QwQ-MathOct-7B"
+#- "scilo/qwen_ft_no_temp"
+#- "sethuiyer/Qwen2.5-7B-Anvita"
+#- "Siheng99/Qwen2.5-7B-Instruct-SEALONG"
+#- "SJTULean/LeanFormalizer_CoT"
+#- "SJTULean/LeanFormalizer_PPO"
+#- "SJTULean/LeanFormalizer_SFT"
+#- "sometimesanotion/KytheraMix-7B-v0.2"
+#- "Spestly/Athena-1-7B"
+#- "suayptalha/HomerCreativeAnvita-Mix-Qw7B"
+#- "tablegpt/TableGPT2-7B"
+#- "TIGER-Lab/ScholarCopilot-v1"
+#- "thomas-yanxin/XinYuan-Qwen2.5-7B-0917"
+#- "Tsunami-th/Tsunami-1.0-7B-Instruct"
+#- "tugstugi/Qwen2.5-7B-Instruct-QwQ-v0.1"
+#- "win10/Verdandi-Qwen2.5-7B"
+#- "winstcha/rewrite-7B-INT4"
+#- "Xiaojian9992024/Qwen2.5-THREADRIPPER-Small"
+#- "Xiaojian9992024/Qwen2.5-Dyanka-7B-Preview"
+#- "xwen-team/Xwen-7B-Chat"
+#- "yellowtown/7B-v0.2"
+#- "ZeroXClem/Qwen2.5-7B-HomerAnvita-NerdMix"
+#- "ZeroXClem/Qwen2.5-7B-HomerCreative-Mix"
 
-#- "bytedance-research/Valley-Eagle-7B"
 #- "Cran-May/T.E-8.1"
 #- "MadeAgents/Hammer2.0-7b"
 #- "Qwen/Qwen2.5-Coder-7B-Instruct"
@@ -119,21 +121,21 @@ models: # uncomment the models you want to merge
 #- "ZHIYII/Qwen2.5-7B-Reward"
 
 dataset:
-  "ifeval_sharegpt.json":
-    mode: "uncertain_bigram" 
-  "bbh_sharegpt.json":
-    mode: "exact_uncertain"
-  "qpqa_sharegpt.json": # too much memory for exact
-    mode: "uncertain_bigram" 
+#  "ifeval_sharegpt.json":
+#    mode: "uncertain_bigram" 
+#  "bbh_sharegpt.json":
+#    mode: "exact_uncertain"
+#  "qpqa_sharegpt.json":
+#    mode: "uncertain_bigram"
   "math_lvl5_sharegpt.json":
     mode: "exact_uncertain"
-  "mmlupro_sharegpt.json":
-    mode: "exact_uncertain"
-  "musr_sharegpt.json":
-    mode: "exact_uncertain"
-  "truthfulqa_sharegpt.json":
-   mode: "exact_uncertain"
-  "arc_sharegpt.json":
-    mode: "exact_uncertain"
-  "longresponse_sharegpt.json":
+#  "mmlupro_sharegpt.json":
+#    mode: "exact_uncertain"
+#  "truthfulqa_sharegpt.json":
+#   mode: "exact_uncertain"
+#  "arc_sharegpt.json":
+#    mode: "exact_uncertain"
+#  "musr_sharegpt.json":
+#    mode: "exact_uncertain"
+  "longresponse2_sharegpt.json":
     mode: "quality"
