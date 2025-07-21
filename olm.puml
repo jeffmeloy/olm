@@ -1,6 +1,5 @@
-@startuml OLM
-title Optimal Layer Merging (OLM) with ES Fine-Tuning
-
+@startuml
+title Optimal Layer Merging (OLM)
 |Configuration|
 start
 :Load YAML Config;
@@ -11,134 +10,110 @@ note right
   - model_pool
   - datasets
   - optimization strategies
-  - ES parameters (sigma, generations)
 endnote
-
 |Model Preparation|
 :Download Required Models;
 note right
   Batch download all models
   from Hugging Face
 endnote
-
 :Select/Validate Base Model;
 note right
   Either:
   - Use provided base model
-  - Dynamically select via
+  - Dynamically select via 
     performance ranking
 endnote
-
-:Build Evaluation Cache;
-note right
-  Pre-tokenize context/responses
-  for faster evaluations
-endnote
-
 |Base Model Setup|
-:Load Base Model & Tokenizer;
+:Load Base Model;
 note right
   CPU-based loading
   bfloat16 precision
 endnote
-
 :Compute Base Metrics;
 note right
   Baseline performance
-  across all datasets.
-  Save to initial merge_report.json
+  across all datasets
 endnote
-
 |Optimization Phases|
 partition "Boundary Layer Optimization" {
   if (boundary_select enabled?) then (yes)
     :Optimize Boundary Components;
     note right
-      - Select best model for
-        (embed_tokens, model.norm, lm_head)
-        based on rank sum.
-      - Apply components to working model.
-      - Update merge_report.json
+      Swap embedding, norm, 
+      and language model head
     endnote
-  else (no)
   endif
 }
-
 partition "Layer-wise Optimization" {
   if (layer_swap enabled?) then (yes)
-    :Iterate Through All Layers;
-
+    :Iterate Layers;
+    note right
+      Forward or backward 
+      based on config
+    endnote
     while (Layers Remaining) is (yes)
-      :For each candidate model in pool:;
+      :Test Layer Candidates;
       note right
-        - Temporarily swap current layer
-          from candidate into working model.
-        - Evaluate on all datasets.
-        - Store metrics.
+        - Swap candidate layer
+        - Evaluate performance
+        - Compute cross-dataset ranks
       endnote
-      :Permanently Update Model with Best Layer;
+      :Select Best Performing Layer;
       note right
-        Select Lowest Aggragate Rank
+        Lowest average rank 
+        across metrics
       endnote
-      :Save Layer State & Update Merge Report;
+      :Update Working Model;
+      :Checkpoint Intermediate State;
     endwhile
-  else (no)
   endif
 }
-
 partition "Tensor-wise Optimization" {
   if (tensor_swap enabled?) then (yes)
-    :Iterate Through All Tensors;
-
+    :Iterate Tensors;
+    note right
+      Focus on weight tensors
+    endnote
     while (Tensors Remaining) is (yes)
-      :For each candidate model in pool:;
+      :Test Tensor Candidates;
       note right
-        - Temporarily swap current tensor
-          from candidate into working model.
-        - Evaluate on all datasets.
-        - Store metrics.
+        - Swap candidate tensor
+        - Evaluate performance
+        - Compute cross-dataset ranks
       endnote
-      :Permanently Update Model with Best Tensor;
+      :Select Best Performing Tensor;
       note right
-        Select Lowest Aggragate Rank
+        Copeland scoring across
+        multiple datasets
       endnote
-
-      partition "(1+λ)-ES Fine-Tuning" {
-        :Compute Tensor SVD and λ;
-        note right
-          λ = max(4, int(4 + 3 * math.log(dim_svd)))
-        endnote
-        : Iterate Through All Generations;
-
-
-        while (Generations Remaining) is (yes)
-          :Generate λ Offspring Tensors;
+      partition "Evolutionary Fine-tuning" {
+        if (es_svd enabled?) then (yes)
+          :SVD-based Evolution;
           note right
-            Perturb singular values (S_svd)
+            - Decompose tensor via SVD
+            - Generate perturbations in SVD space
+            - Multi-generation optimization
+            - (1+λ) evolutionary strategy
           endnote
-          :Evaluate each Offspring;
+        endif
+        if (es_norm enabled?) then (yes)
+          :Norm-based Evolution;
           note right
-            - Temporarily swap current offspring
-              tensor into working model.
-            - Evaluate on all datasets.
-            - Store metrics.
+            - Separate direction/magnitude
+            - Optimize magnitude scaling
+            - Log-space perturbations
+            - Copeland offspring selection
           endnote
-          :Select Best Offspring;
-          note right
-            Select Lowest Aggragate Rank
-          endnote
-          :Update Model with Best Offspring;
-        endwhile
+        endif
       }
-
-      :Save Tensor State & Update Merge Report;
+      :Update Working Model;
+      :Checkpoint Intermediate State;
     endwhile
-  else (no)
   endif
 }
-
 |Finalization|
-:Save Final Optimized Model;
-:Generate/Finalize Comprehensive Merge Report;
+:Save Final Merged Model;
+:Generate Comprehensive Merge Report;
 stop
 @enduml

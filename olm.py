@@ -21,11 +21,34 @@ logger = logging.getLogger(__name__)
 # --- Model and Dataset Handling ---
 
 
+def _get_target_parameter_units(model: AutoModelForCausalLM) -> dict[str, list[str]]:
+    """Groups parameter names by their functional unit (e.g., q_proj, mlp.gate_proj, input_layernorm)."""
+    units = defaultdict(list)
+    pattern = re.compile(r"^(.*?)\.(weight|bias)$")
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:  # Skip non-trainable
+            continue
+
+        match = pattern.match(name)
+        if match:
+            unit_name = match.group(1)
+            units[unit_name].append(name)
+
+    final_units = {}
+    for unit_name, param_names in units.items():
+        if param_names:
+            final_units[unit_name] = param_names
+
+    # logger.info(f"Identified {len(final_units)} parameter units for optimization.")
+    return final_units
+
+
 def get_model_from_merge_report(
     merge_report_path: str,
     models_dir: str,
-) -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
-    """Reconstruct a model from a merge report by loading the base model and swapping in specified layers."""
+) -> Tuple[AutoModelForCausalLM, AutoTokenizer, dict]:
+    """Reconstruct a model from a merge report by loading the base model and swapping in specified layers and tensors."""
     with open(merge_report_path) as f:
         merge_report = json.load(f)
 
@@ -34,7 +57,9 @@ def get_model_from_merge_report(
     logger.info(f"Loading base model {base_model_name}")
     model, tokenizer = load_model(str(base_model_path), "cpu")
 
-    if "boundary_layers" in merge_report and merge_report["boundary_layers"]["name"]:
+    if "boundary_layers" in merge_report and merge_report["boundary_layers"].get(
+        "name"
+    ):
         logger.info(
             f"Applying boundary layers from {merge_report['boundary_layers']['name']}"
         )
@@ -69,7 +94,57 @@ def get_model_from_merge_report(
                     )
                     logger.info("Keeping base model layer")
 
-    return model, tokenizer
+    if "tensors" in merge_report:
+        logger.info("Re-applying optimized tensors from merge report...")
+        working_params = dict(model.named_parameters())
+        parameter_units = _get_target_parameter_units(model)
+
+        # Create a reverse map from any parameter name to its functional unit name.
+        param_to_unit_map = {}
+        for unit_name, param_list in parameter_units.items():
+            for param_name in param_list:
+                param_to_unit_map[param_name] = unit_name
+
+        for tensor_name, tensor_info in tqdm(
+            merge_report["tensors"].items(), desc="Reconstructing Tensors"
+        ):
+            tensor_source_model = tensor_info.get("best_model")
+
+            if not tensor_source_model:
+                continue
+
+            unit_name = param_to_unit_map.get(tensor_name)
+            if not unit_name:
+                logger.warning(
+                    f"Could not find parameter unit for {tensor_name}, applying tensor individually."
+                )
+                unit_param_names = [tensor_name]
+            else:
+                unit_param_names = parameter_units.get(unit_name, [tensor_name])
+
+            try:
+                tensor_source_path = Path(models_dir) / tensor_source_model.replace(
+                    "/", "_"
+                )
+                tensor_source, _ = load_model(str(tensor_source_path), "cpu")
+                source_params = dict(tensor_source.named_parameters())
+
+                for param_name in unit_param_names:
+                    if param_name in working_params and param_name in source_params:
+                        working_params[param_name].data.copy_(
+                            source_params[param_name].data
+                        )
+
+                del tensor_source
+                torch.cuda.empty_cache()
+
+            except Exception as e:
+                logger.error(
+                    f"Error applying unit for tensor {tensor_name} from {tensor_source_model}: {e}"
+                )
+                logger.info(f"Keeping existing tensor for unit of {tensor_name}")
+
+    return model, tokenizer, merge_report
 
 
 def download_model(model_name: str, models_dir: str) -> Optional[str]:
@@ -125,6 +200,7 @@ def get_datasets(config: dict) -> dict:
                 datasets[dataset_name] = {
                     "data": json.load(f),
                     "mode": dataset_config["mode"],
+                    "think": dataset_config["think"],
                 }
     except Exception as e:
         logger.error(f"Failed to load datasets: {e}")
@@ -151,14 +227,14 @@ def get_context(conversation: dict) -> str:
 
 
 @torch.no_grad()
-def compute_response_quality(
+def compute_response_diversity(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     conversation: dict,
     max_length: int = 4096,
     cache: Optional[dict] = None,
 ) -> float:
-    """Compute the quality of a generated response."""
+    """Compute diversity of the response."""
     if cache:
         # Use cached context
         context_ids = cache["context_ids"].to(model.device)
@@ -182,6 +258,10 @@ def compute_response_quality(
         attention_mask=inputs.attention_mask,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
+        use_cache=True,
+        output_attentions=False,
+        output_hidden_states=False,
+        return_dict_in_generate=False,
     )
 
     new_tokens_ids = generated_ids[0, inputs.input_ids.size(1) :]
@@ -195,34 +275,20 @@ def compute_response_quality(
         return max_length
 
     words = response_text.split()
-    total_words = len(words)
-    if total_words < 100:
-        return max_length
-
-    if max(len(word) for word in words) > 20:
-        return max_length
-
-    num_words = len(words)
     num_unique_words = len(set(words))
-    length_penalty = min(num_words, max_length) / max_length
-    repitition_penalty = num_unique_words / num_words
-    quality_score = 1 / (length_penalty * repitition_penalty**2)
+    diversity = max_length / max(num_unique_words, 1)
 
-    # logger.info(
-    #    f"Words: {total_words}, Unique: {len(set(words))}, Score: {quality_score}"
-    # )
-
-    return quality_score
+    return diversity
 
 
 @torch.no_grad()
-def compute_uncertain_bigram(
+def compute_bigram_loss(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     conversation: dict,
     cache: Optional[dict] = None,
 ) -> float:
-    """Compute bigram loss that rewards correct responses and distribution preservation."""
+    """Lower scores are better: (correct + certain) < (correct + uncertain) < (incorrect uncertain) < (incorrect certain)"""
     if cache:
         context_ids = cache["context_ids"].to(model.device)
         response_ids = cache["response_ids"].to(model.device)
@@ -241,58 +307,83 @@ def compute_uncertain_bigram(
         context_end_idx = context_ids.input_ids.size(1)
 
     outputs = model(full_ids)
+
     shift_logits = outputs.logits[:, context_end_idx - 1 : -2, :]
-    next_logits = outputs.logits[:, context_end_idx:-1, :]
     shift_probs = torch.softmax(shift_logits, dim=-1)
-    next_probs = torch.softmax(next_logits, dim=-1)
     shift_labels = response_ids.input_ids[:, :-1]
-    next_labels = response_ids.input_ids[:, 1:]
     shift_correct = torch.gather(shift_probs, 2, shift_labels.unsqueeze(-1)).squeeze(-1)
-    next_correct = torch.gather(next_probs, 2, next_labels.unsqueeze(-1)).squeeze(-1)
     shift_max, _ = torch.max(shift_probs, dim=-1)
-    next_max, _ = torch.max(next_probs, dim=-1)
     shift_wrong = shift_correct < shift_max
+    shift_score = torch.where(shift_wrong, 1.0, 1.0 - shift_max)
+
+    next_logits = outputs.logits[:, context_end_idx:-1, :]
+    next_probs = torch.softmax(next_logits, dim=-1)
+    next_labels = response_ids.input_ids[:, 1:]
+    next_correct = torch.gather(next_probs, 2, next_labels.unsqueeze(-1)).squeeze(-1)
+    next_max, _ = torch.max(next_probs, dim=-1)
     next_wrong = next_correct < next_max
-    shift_score = torch.where(shift_wrong, 1.0 + shift_max, shift_max)
-    next_score = torch.where(next_wrong, 1.0 + next_max, next_max)
-    combined_score = (shift_score + next_score).mean().item()
-    return combined_score
+    next_score = torch.where(next_wrong, 1.0, 1.0 - next_max)
+    return (shift_score + next_score).mean().item()
 
 
 @torch.no_grad()
-def compute_exact_uncertain_match(
+def compute_exact_match(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     conversation: dict,
     cache: Optional[dict] = None,
 ) -> float:
-    """Lower scores are better: (correct + uncertain) < (correct + certain) < (incorrect uncertain) < (incorrect certain)"""
+    """Autoregressive exact match evaluation for a model's response to a conversation, without teacher forcing
+    Lower scores are better: (correct + certain) < (correct + uncertain) < (incorrect uncertain) < (incorrect certain)"""
+
     if cache:
         context_ids = cache["context_ids"].to(model.device)
         expected_ids = cache["response_ids"].to(model.device)
     else:
+        # prevents thinking output in reasoning models
+        reasoning_mask = "<think>\\n\\n</think>\\n\\nCorrect answer:"
         context = get_context(conversation)
+        context += reasoning_mask
         expected_response = f"{conversation['conversation'][-1]['value']}"
         context_ids = tokenizer(context, return_tensors="pt").to(model.device)
-        expected_ids = tokenizer(expected_response, return_tensors="pt").to(
+        expected_ids = tokenizer(" " + expected_response, return_tensors="pt").to(
             model.device
         )
 
     current_ids = context_ids.input_ids
     all_logits = []
 
-    for i in range(len(expected_ids.input_ids[0])):
-        outputs = model(current_ids)
-        all_logits.append(outputs.logits[:, -1:, :].detach())
+    debug = False
+    num_expected_tokens = len(expected_ids.input_ids[0])
+    prompt_len = context_ids.input_ids.size(1)
+
+    for i in range(num_expected_tokens):
+        outputs = model(current_ids)  # Get model outputs incrementally
+        next_token_logits = outputs.logits[:, -1:, :]  # Logits for the very next token
+        all_logits.append(next_token_logits.detach())
+        predicted_token_id = next_token_logits.argmax(dim=-1)
+        current_ids = torch.cat([current_ids, predicted_token_id], dim=1)
+
+        if debug:
+            generated_ids = current_ids[:, prompt_len:]
+            incremental_output = tokenizer.decode(
+                generated_ids[0], skip_special_tokens=True
+            )
+            print(f"DEBUG (step {i + 1}/{num_expected_tokens}): '{incremental_output}'")
+            input("press any key to continue....")
 
     response_logits = torch.cat(all_logits, dim=1)
     predicted_tokens = response_logits.argmax(dim=-1)
     correct_mask = predicted_tokens == expected_ids.input_ids
     probs = torch.softmax(response_logits, dim=-1)
-
     max_probs = probs.max(dim=-1).values
-    base_incorrect_penalty = 1.0
-    result = torch.where(correct_mask, max_probs, base_incorrect_penalty + max_probs)
+    result = torch.where(correct_mask, 1.0 - max_probs, 1.0 + max_probs)
+    final_output = float(result.mean().item())
+    if debug:
+        print(result)
+        print(f"DEBUG: Final output score: {final_output}")
+        input("press any key to continue....")
+
     return float(result.mean().item())
 
 
@@ -318,18 +409,14 @@ def evaluate_model_on_dataset(
         # Extract conversation-specific cache if available
         conv_cache = cache.get(idx) if cache else None
 
-        if mode == "quality":
-            metric = compute_response_quality(
+        if mode == "diversity":
+            metric = compute_response_diversity(
                 model, tokenizer, conversation, 4096, conv_cache
             )
-        elif mode == "uncertain_bigram":
-            metric = compute_uncertain_bigram(
-                model, tokenizer, conversation, conv_cache
-            )
-        elif mode == "exact_uncertain":
-            metric = compute_exact_uncertain_match(
-                model, tokenizer, conversation, conv_cache
-            )
+        elif mode == "bigram_loss":
+            metric = compute_bigram_loss(model, tokenizer, conversation, conv_cache)
+        elif mode == "exact_match":
+            metric = compute_exact_match(model, tokenizer, conversation, conv_cache)
         total_metric += metric
 
     model.to("cpu")
@@ -438,46 +525,23 @@ def select_best_model(
     layer_metrics: dict[str, dict[str, float]] = None,
     selection: str = "ranks",
 ) -> str:
-    """Select the best model based on all rank aggregation"""
-    return min(model_ranks.items(), key=lambda x: sum(x[1]))[0]
+    """Select the best model based on Copeland score (pairwise victories)"""
+    if selection != "ranks" or not model_ranks:
+        return min(model_ranks.items(), key=lambda x: sum(x[1]))[0]
 
+    models = list(model_ranks.keys())
+    ranks_matrix = torch.tensor([model_ranks[m] for m in models])
 
-def calculate_normalized_effective_rank(tensor: torch.Tensor) -> float:
-    """Calculate the Normalized Effective Rank (NER) of a matrix using PyTorch."""
-    try:
-        # Get device and prepare tensor in one step
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        A = tensor.to(device=device, dtype=torch.float32)
-        A /= max(A.abs().max().item(), 1e-10)  # Normalize tensor
+    # Broadcasting to compare all pairs: (n_models, 1, n_datasets) vs (1, n_models, n_datasets)
+    pairwise_wins = (ranks_matrix[:, None, :] < ranks_matrix[None, :, :]).sum(dim=2)
 
-        if A.dim() == 1:
-            A = A.unsqueeze(0)
-        if 1 in A.shape:
-            S = A.abs().view(-1)
-        else:
-            S = torch.linalg.svdvals(A)
+    # Copeland scores: count where model i beats model j more often than j beats i
+    copeland_scores = (pairwise_wins > pairwise_wins.T).sum(dim=1)
 
-        # Filter near-zero values and compute entropy
-        mask = S > 1e-10
-        if not mask.any():
-            return 1.0
+    for model, score in zip(models, copeland_scores.tolist()):
+        logger.info(f"Model: {model}, Copeland Score: {score}")
 
-        S = S[mask]
-        s_sum = S.sum()
-        S.div_(s_sum)  # Normalize in-place
-
-        # Compute entropy and NER
-        H = -(S * torch.log2(S)).sum()
-        H_max = torch.log2(torch.tensor(S.numel(), dtype=torch.float32, device=device))
-        ner = 1.0 if H_max <= 0 else (1 - (H / H_max)).item()
-
-        del A, S, H
-        if device == "cuda":
-            torch.cuda.empty_cache()
-        return ner
-    except Exception as e:
-        logger.error(f"Error calculating NER: {e}")
-        return 1.0
+    return models[copeland_scores.argmax().item()]
 
 
 # --- Base Model Handling and Initialization ---
@@ -522,20 +586,11 @@ def get_base_metrics(
 ) -> None:
     """Copy base model files and establish baseline metrics."""
     logger.info(f"Copying base model files to {output_dir}")
-    for file in os.listdir(base_path):
-        try:
-            if not file.startswith("."):
-                shutil.copy2(
-                    os.path.join(base_path, file), os.path.join(output_dir, file)
-                )
-        except Exception as e:
-            logger.error(f"Error copying {file}: {e}")
 
     logger.info(f"Evaluating {base_model_name} on datasets")
     base_metrics = {}
     for dataset_name, dataset in datasets.items():
-        try:
-            # Use evaluation cache if available
+        try:  # Use evaluation cache if available
             dataset_cache = (
                 evaluation_cache.get(dataset_name) if evaluation_cache else None
             )
@@ -565,25 +620,6 @@ def get_base_metrics(
 
 
 # --- Processing and Degradation Handling ---
-
-
-def get_ner_metrics(working_model, layer_idx, model_name, layer_metrics):
-    """Calculate NER for the current model while it's already loaded."""
-    if "ner" not in layer_metrics:
-        layer_metrics["ner"] = {}
-    if isinstance(layer_idx, int):  # For layer-wise optimization
-        layer = get_layer(working_model, layer_idx)
-        weight_matrices = [
-            p for n, p in layer.named_parameters() if "weight" in n and p.dim() > 1
-        ]
-        ner_values = [calculate_normalized_effective_rank(w) for w in weight_matrices]
-        ner = sum(ner_values) / len(ner_values)
-    else:  # For tensor-wise optimization
-        tensor = dict(working_model.named_parameters())[layer_idx]
-        ner = calculate_normalized_effective_rank(tensor)
-    layer_metrics["ner"][model_name] = ner
-    logger.info(f"{model_name}: NER: {ner}")
-    return layer_metrics
 
 
 def process_model(
@@ -665,19 +701,10 @@ def process_model(
                     layer_metrics[remaining] = {}
                 layer_metrics[remaining][model_name] = float("inf")
 
-            # Just set NER to inf for failed models - no need to calculate
-            if "ner" not in layer_metrics:
-                layer_metrics["ner"] = {}
-            layer_metrics["ner"][model_name] = float("inf")
-            return layer_metrics
-
-    # Model passed all dataset checks - calculate NER
-    layer_metrics = get_ner_metrics(working_model, layer_idx, model_name, layer_metrics)
-
     return layer_metrics
 
 
-# --- Boundary Layer Optimization ---
+# --- boundary layer optimization ---
 
 
 def _apply_boundary_components(
@@ -726,29 +753,6 @@ def save_tensor_state(
     }
 
     json.dump(report, open(report_path, "w"), indent=4)
-
-
-def _get_target_parameter_units(model: AutoModelForCausalLM) -> dict[str, list[str]]:
-    """Groups parameter names by their functional unit (e.g., q_proj, mlp.gate_proj, input_layernorm)."""
-    units = defaultdict(list)
-    pattern = re.compile(r"^(.*?)\.(weight|bias)$")
-
-    for name, param in model.named_parameters():
-        if not param.requires_grad:  # Skip non-trainable
-            continue
-
-        match = pattern.match(name)
-        if match:
-            unit_name = match.group(1)
-            units[unit_name].append(name)
-
-    final_units = {}
-    for unit_name, param_names in units.items():
-        if param_names:
-            final_units[unit_name] = param_names
-
-    logger.info(f"Identified {len(final_units)} parameter units for optimization.")
-    return final_units
 
 
 def select_component(
@@ -820,7 +824,6 @@ def select_component(
 
                 # Evaluate on selected datasets
                 for dataset_name, dataset in selected_datasets.items():
-                    # Use cache if available
                     dataset_cache = (
                         evaluation_cache.get(dataset_name) if evaluation_cache else None
                     )
@@ -899,7 +902,21 @@ def layer_wise_optimization(
     num_layers = working_model.config.num_hidden_layers
     direction = config.get("direction", "forward")
 
+    processed_layers = set()
+    if "layers" in merge_report:
+        processed_layers = set(int(k) for k in merge_report["layers"].keys())
+        if processed_layers:
+            logger.info(
+                f"Found {len(processed_layers)} already processed layers in the merge report: {sorted(list(processed_layers))}"
+            )
+
     for layer_idx in layer_sequence(num_layers, direction):
+        if layer_idx in processed_layers:
+            logger.info(
+                f"Skipping layer {layer_idx}, already processed in merge report."
+            )
+            continue
+
         logger.info(f"\nOptimizing layer {layer_idx}")
         layer_metrics = {dataset: {} for dataset in datasets}
 
@@ -957,6 +974,9 @@ def layer_wise_optimization(
                 f"Applied layer {layer_idx} from {best_model} (avg rank: {avg_rank})"
             )
 
+            with open(os.path.join(output_dir, "merge_report.json")) as f:
+                merge_report.update(json.load(f))
+
             working_model.save_pretrained(
                 output_dir, safe_serialization=True, push_to_hub=False, exist_ok=True
             )
@@ -979,56 +999,49 @@ def tensor_wise_optimization(
     merge_report: dict,
     evaluation_cache: Optional[dict] = None,
 ) -> AutoModelForCausalLM:
-    """Unit-wise optimization: functional parameters treated as coherent units."""
-    logger.info("Starting unit-wise optimization...")
+    """Enhanced tensor optimization
+
+    TODO: Optimal tensor synthesis
+    1. Instrument the Candidate Loop for State Capture
+    Right after each tensor swap, at the end of the tensor loop run the model scanner to capture the computational fingerprint and compute the optimal tensor based on the static and dynamic model and performance metrics.
+    """
     parameter_units = _get_target_parameter_units(working_model)
     unit_names = list(parameter_units.keys())
 
-    # Reverse if needed
     if config.get("direction", "forward") == "backward":
         unit_names.reverse()
 
     skip_norm = config.get("skip_norm", False)
     working_params_dict = dict(working_model.named_parameters())
+    processed_tensors = set(merge_report.get("tensors", {}).keys())
 
-    for unit_name in tqdm(unit_names, desc="Optimizing Units"):
-        # Skip norm layers if configured
+    for unit_name in tqdm(unit_names, desc="Continuous Optimization"):
         if skip_norm and any("norm" in part for part in unit_name.split(".")):
             continue
 
-        logger.info(f"\n--- Optimizing: {unit_name} ---")
         unit_param_names = parameter_units[unit_name]
-        unit_metrics = {dataset_name: {} for dataset_name in datasets}
+        weight_tensor_name = next((p for p in unit_param_names if "weight" in p), None)
 
-        # Get representative weight tensor for NER
-        weight_tensor_name = next(
-            (p for p in unit_param_names if "weight" in p),
-            next(iter(unit_param_names), None),
-        )
-        if not weight_tensor_name:
+        if not weight_tensor_name or weight_tensor_name in processed_tensors:
             continue
 
-        # Save originals
+        # Standard tensor swapping (unchanged)
+        unit_metrics = {dataset_name: {} for dataset_name in datasets}
         orig_states = {
             name: param.data.clone()
             for name, param in working_params_dict.items()
             if name in unit_param_names
         }
-        if not orig_states:
-            continue
 
-        # Test each candidate
         best_model = config.get("base_model", None)
         if config.get("tensor_swap", True):
             for model_name in model_pool:
                 try:
-                    # Load and apply candidate
                     candidate, _ = load_model(
                         f"{models_dir}/{model_name.replace('/', '_')}", "cpu"
                     )
                     candidate_params = dict(candidate.named_parameters())
 
-                    # Apply unit params
                     for param_name in unit_param_names:
                         if (
                             param_name in working_params_dict
@@ -1038,7 +1051,6 @@ def tensor_wise_optimization(
                                 candidate_params[param_name].data
                             )
 
-                    # Evaluate
                     unit_metrics = process_model(
                         model_name=model_name,
                         layer_metrics=unit_metrics,
@@ -1051,41 +1063,34 @@ def tensor_wise_optimization(
                         improve_all=config.get("improve_all"),
                         evaluation_cache=evaluation_cache,
                     )
+
                 except Exception as e:
-                    logger.error(f"Error evaluating {model_name} on {unit_name}: {e}")
-                    # Mark as bad
                     for ds in unit_metrics:
                         unit_metrics[ds][model_name] = float("inf")
+                    logger.warning(f"Model {model_name} failed to improve metrics: {e}")
                 finally:
-                    # Restore original state
                     for name, data in orig_states.items():
                         if name in working_params_dict:
                             working_params_dict[name].data.copy_(data)
-
                     if "candidate" in locals():
                         del candidate
                         torch.cuda.empty_cache()
 
-            # Find best model
             model_ranks = compute_layer_ranks(unit_metrics)
-            if not model_ranks:
-                continue
+            if model_ranks:
+                best_model = select_best_model(
+                    model_ranks, selection=config.get("selection", "ranks")
+                )
 
-            best_model = select_best_model(
-                model_ranks, selection=config.get("selection", "ranks")
-            )
-
-        # Apply best model's unit params permanently
+        # Apply best model
         best_source, _ = load_model(
             f"{models_dir}/{best_model.replace('/', '_')}", "cpu"
         )
         best_params = dict(best_source.named_parameters())
 
-        applied = 0
         for param_name in unit_param_names:
             if param_name in working_params_dict and param_name in best_params:
                 working_params_dict[param_name].data.copy_(best_params[param_name].data)
-                applied += 1
 
         best_metrics = base_metrics.copy()
         for dataset_name, dataset in best_metrics.items():
@@ -1093,9 +1098,10 @@ def tensor_wise_optimization(
             if score == float("inf"):
                 score = base_metrics[dataset_name]
             best_metrics[dataset_name] = score
+        updated_metrics = best_metrics.copy()
 
-        if config.get("es_swap", False):
-            updated_metrics = fine_tune_tensor_1plambdaES(
+        if config.get("es_svd", False):
+            updated_metrics = fine_tune_tensor_svd_es(
                 working_model,
                 weight_tensor_name,
                 datasets,
@@ -1103,39 +1109,40 @@ def tensor_wise_optimization(
                 evaluation_cache,
                 best_metrics,
                 samples=config.get("samples", 200),
-                generations=config.get("es_generations", 1),
-                initial_sigma=config.get("es_sigma", 0.5),
+                generations=config.get("es_svd_generations", 1),
+                initial_sigma=config.get("es_svd_sigma", 0.5),
             )
 
-        logger.info(f"Unit {unit_name}: updated metrics: {updated_metrics}")
+        if config.get("es_norm", False):
+            updated_metrics = fine_tune_tensor_norm_es(
+                working_model,
+                weight_tensor_name,
+                datasets,
+                tokenizer,
+                evaluation_cache,
+                updated_metrics,
+                samples=config.get("samples", 200),
+                generations=config.get("es_norm_generations", 1),
+                initial_sigma=config.get("es_norm_sigma", 0.01),
+            )
+
+        # Save state
         for dataset_name in datasets:
             unit_metrics[dataset_name][best_model] = updated_metrics[dataset_name]
 
         save_tensor_state(
-            working_model,
-            unit_metrics,
-            weight_tensor_name,
-            output_dir,
-            best_model,
+            working_model, unit_metrics, weight_tensor_name, output_dir, best_model
         )
-        logger.info(f"Unit {unit_name}: applied {applied} params from {best_model}")
-
         del best_source
         torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-
-        # Checkpoint
         working_model.save_pretrained(
-            output_dir,
-            safe_serialization=True,
-            push_to_hub=False,
-            exist_ok=True,
+            output_dir, safe_serialization=True, push_to_hub=False, exist_ok=True
         )
 
     return working_model
 
 
-# --- Evolutionary based fine-tuning ---
+# --- evolutionary based fine-tuning ---
 
 
 @torch.no_grad()
@@ -1185,6 +1192,7 @@ def generate_noise_from_svd_coeffs(
     max_s = S_target_subset.abs().max()
 
     # Calculate scaling factors and normalize in-place
+    # with an inverse damping approach to reduce noise impact for the largest singular values
     if max_s > epsilon:
         scaling = torch.sqrt(max_s / (S_target_subset.abs() + epsilon))
         scaling /= scaling.mean()
@@ -1214,7 +1222,7 @@ def generate_noise_from_svd_coeffs(
 
 
 @torch.no_grad()
-def fine_tune_tensor_1plambdaES(
+def fine_tune_tensor_svd_es(
     working_model: AutoModelForCausalLM,
     tensor_name: str,
     datasets: dict[str, dict[str, any]],
@@ -1227,8 +1235,9 @@ def fine_tune_tensor_1plambdaES(
     noise_clamp_val: float = 3.0,
     epsilon: float = 1e-10,
 ) -> dict[str, float]:
-    """Fine-tunes a tensor using an Estimation of Distribution Algorithm (EDA) approach."""
-    # Quick validation
+    """Fine-tunes a tensor using an 1+lambda ES approach."""
+
+    # quick validation
     params = dict(working_model.named_parameters())
     if tensor_name not in params or not torch.is_floating_point(
         params[tensor_name].data
@@ -1243,7 +1252,7 @@ def fine_tune_tensor_1plambdaES(
         )
         return baseline_metrics
 
-    # Setup
+    # setup
     original_tensor_dtype = original_model_tensor.dtype
     original_tensor_shape = original_model_tensor.shape
     compute_device = original_model_tensor.device
@@ -1264,25 +1273,27 @@ def fine_tune_tensor_1plambdaES(
         )
         return baseline_metrics
 
-    # Initialize parameters
+    # initialize parameters
     dim_s = S_svd.numel()
     target_s_indices = torch.arange(dim_s, device=compute_device)
     sigma_s = initial_sigma * max(S_svd.std().item(), epsilon)
 
-    # Standard CME-ES parameter
+    # standard CME-ES parameter
     _lambda = max(4, int(4 + 3 * math.log(dim_s)))
 
-    # Log initial stats
+    # log initial stats
     tensor_stats = original_model_tensor.data.float()
     logger.info(
-        f"Tensor {tensor_name} initial stats: mean={tensor_stats.mean().item()}, std={tensor_stats.std().item()}, "
+        f"Tensor {tensor_name}, Baseline Metrics {baseline_metrics}, "
+        f"Initial stats: mean={tensor_stats.mean().item()}, std={tensor_stats.std().item()}, "
         f"min={tensor_stats.min().item()}, max={tensor_stats.max().item()}"
     )
+
     logger.info(
         f"Optimizing {tensor_name} (SVD dim: {dim_s}) with pop: {_lambda}, for {generations} generations. Init sigma: {sigma_s}"
     )
 
-    # Preallocate buffers
+    # preallocate buffers
     delta_s_batch = torch.empty(
         (_lambda, dim_s), device=compute_device, dtype=torch.float32
     )
@@ -1356,12 +1367,7 @@ def fine_tune_tensor_1plambdaES(
                 offspring_metrics_list[i] = metrics.copy()
                 logger.info(f"{current_eval} Metrics: {metrics}")
 
-        # Compute ranks for each offspring across all datasets
-        aggregate_ranks = torch.full(
-            (_lambda,), float("inf"), device=compute_device, dtype=torch.float32
-        )
-
-        # Build matrix of scores for ranking
+        # Build offspring ranks for Copeland selection
         valid_offspring = [i for i in range(_lambda) if offspring_metrics_list[i]]
         if not valid_offspring:
             logger.warning(f"{genstring} No valid offspring.")
@@ -1372,58 +1378,256 @@ def fine_tune_tensor_1plambdaES(
             )
             continue
 
-        # Find offspring with best aggregate rank
-        dataset_names = list(datasets.keys())
-        ranks_sum = {i: 0 for i in valid_offspring}
-        for ds_name in dataset_names:
+        # Compute ranks for each dataset
+        offspring_ranks = {}
+        for ds_name in datasets.keys():
             scores = [
                 (i, offspring_metrics_list[i].get(ds_name, float("inf")))
                 for i in valid_offspring
             ]
             scores.sort(key=lambda x: x[1])
             for rank, (idx, _) in enumerate(scores, 1):
-                ranks_sum[idx] += rank
-        best_idx = min(ranks_sum.items(), key=lambda x: x[1])[0]
-        aggregate_ranks[best_idx] = ranks_sum[best_idx]
-        current_best_metrics = offspring_metrics_list[best_idx].copy()
-        logger.info(
-            f"{genstring} Selected rank-1 offspring (idx={best_idx}, aggregate_rank={ranks_sum[best_idx]}). "
-            f"Metrics: {current_best_metrics}"
-        )
+                if idx not in offspring_ranks:
+                    offspring_ranks[idx] = []
+                offspring_ranks[idx].append(rank)
 
-        # Apply winning noise and update in-place
-        winning_noise_mult, _ = generate_noise_from_svd_coeffs(
-            original_tensor_shape,
-            U_svd,
-            S_svd,
-            V_svd,
-            target_s_indices,
-            delta_s_batch[best_idx],
-            epsilon,
-            noise_clamp_val,
-        )
-        current_best_flat.mul_(winning_noise_mult)
-
-        # Update SVD for next generation if needed
-        if gen < generations - 1:
-            U_new, S_new, V_new = calculate_full_svd(
-                current_best_flat.reshape(original_tensor_shape), epsilon
+        # Filter to improved offspring only
+        improved_indexes = [
+            i
+            for i in valid_offspring
+            if any(
+                offspring_metrics_list[i][ds] < current_best_metrics[ds]
+                for ds in datasets
             )
-            U_svd, S_svd, V_svd = U_new, S_new, V_new
-            sigma_s = initial_sigma * max(S_svd.std().item(), epsilon)
-            logger.info(f"{genstring} SVD updated. New sigma: {sigma_s}")
+        ]
+
+        if not improved_indexes:
+            logger.info(f"{genstring} No improved offspring found. Keeping original.")
+        else:
+            # Build ranks dict for improved offspring only
+            improved_ranks = {str(i): offspring_ranks[i] for i in improved_indexes}
+
+            # Use Copeland selection
+            best_idx_str = select_best_model(improved_ranks, selection="ranks")
+            best_idx = int(best_idx_str)
+
+            current_best_metrics = offspring_metrics_list[best_idx].copy()
+            logger.info(
+                f"{genstring} Selected offspring (idx={best_idx}) via Copeland. "
+                f"Metrics: {current_best_metrics}"
+            )
+
+            # Apply winning noise and update in-place
+            winning_noise_mult, _ = generate_noise_from_svd_coeffs(
+                original_tensor_shape,
+                U_svd,
+                S_svd,
+                V_svd,
+                target_s_indices,
+                delta_s_batch[best_idx],
+                epsilon,
+                noise_clamp_val,
+            )
+            current_best_flat.mul_(winning_noise_mult)
+
+            # Update SVD for next generation if needed
+            if gen < generations - 1:
+                U_new, S_new, V_new = calculate_full_svd(
+                    current_best_flat.reshape(original_tensor_shape), epsilon
+                )
+                U_svd, S_svd, V_svd = U_new, S_new, V_new
+                sigma_s = initial_sigma * 0.8 * max(S_svd.std().item(), epsilon)
+                logger.info(f"{genstring} SVD updated. New sigma: {sigma_s}")
 
         # Update model tensor with current best
         original_model_tensor.data.copy_(
             current_best_flat.reshape(original_tensor_shape).to(original_tensor_dtype)
         )
 
-    logger.info(f"ES for {tensor_name} done. Generations: {generations}")
+    logger.info(f"SVD ES for {tensor_name} done. Generations: {generations}")
     logger.info(f"Final metrics for {tensor_name}: {current_best_metrics}")
     return current_best_metrics
 
 
-# --- OLM Function ---
+@torch.no_grad()
+def fine_tune_tensor_norm_es(
+    working_model: AutoModelForCausalLM,
+    tensor_name: str,
+    datasets: dict[str, dict[str, any]],
+    tokenizer: AutoTokenizer,
+    evaluation_cache: dict[str, dict[int, dict[str, any]]],
+    baseline_metrics: dict[str, float],
+    samples: int = 200,
+    generations: int = 3,
+    initial_sigma: float = 0.005,  # A small default is crucial as this method is volatile
+    epsilon: float = 1e-10,
+) -> dict[str, float]:
+    """Fine-tunes a tensor using a Norm-based (1+lambda) ES approach."""
+    # quick validation
+    params = dict(working_model.named_parameters())
+    if tensor_name not in params or not torch.is_floating_point(
+        params[tensor_name].data
+    ):
+        logger.warning(f"Tensor {tensor_name} not found or not float. Skipping.")
+        return baseline_metrics
+
+    original_model_tensor = params[tensor_name]
+    if original_model_tensor.dim() == 1 or 1 in original_model_tensor.shape:
+        logger.info(
+            f"Tensor {tensor_name} is 1D (shape: {original_model_tensor.shape}). SVD opt skipped."
+        )
+        return baseline_metrics
+
+    # setup
+    original_tensor_dtype = original_model_tensor.dtype
+    compute_device = original_model_tensor.device
+    current_best_metrics = baseline_metrics.copy()
+
+    # Norm decomposition: separate the tensor into per-row direction and magnitude
+    magnitude_norms = torch.linalg.norm(original_model_tensor.data, dim=1, keepdim=True)
+    directions = original_model_tensor.data / (magnitude_norms + epsilon)
+    current_best_magnitudes = magnitude_norms.squeeze(1).clone()
+
+    # Initialize parameters
+    dim_s = current_best_magnitudes.numel()
+    sigma_s = initial_sigma  # The step size will decay over generations
+
+    # Standard CME-ES parameter
+    _lambda = max(4, int(4 + 3 * math.log(dim_s)))
+
+    # Log initial stats
+    tensor_stats = original_model_tensor.data.float()
+    logger.info(
+        f"Tensor {tensor_name}, Baseline Metrics {baseline_metrics}, "
+        f"Initial stats: mean={tensor_stats.mean().item()}, std={tensor_stats.std().item()}, "
+        f"min={tensor_stats.min().item()}, max={tensor_stats.max().item()}"
+    )
+
+    logger.info(
+        f"Optimizing {tensor_name} (Norm dim: {dim_s}) with pop: {_lambda}, for {generations} generations. Init sigma: {sigma_s}"
+    )
+
+    # Preallocate buffers
+    perturbations_batch = torch.empty(
+        (_lambda, dim_s), device=compute_device, dtype=torch.float32
+    )
+    offspring_metrics_list = [{} for _ in range(_lambda)]
+
+    for gen in range(generations):
+        genstring = f"  Generation {gen + 1}/{generations}"
+        logger.info(f"\n--- {genstring}, Tensor: {tensor_name}, Sigma: {sigma_s} ---")
+
+        # Generate random perturbations in log-space and scale by sigma
+        log_magnitudes = torch.log(current_best_magnitudes + epsilon)
+        perturbations_batch.normal_(0, 1)
+        perturbations_batch.mul_(sigma_s)
+
+        # Create and evaluate offspring
+        for i in range(_lambda):
+            current_eval = f"{genstring} Offspring {i + 1}/{_lambda}:"
+
+            # Apply noise to magnitudes via log-space to ensure positivity
+            candidate_log_mags = log_magnitudes + perturbations_batch[i]
+            candidate_magnitudes = torch.exp(candidate_log_mags)
+
+            # Reconstruct the full tensor and apply it to the model
+            reconstructed_tensor = directions * candidate_magnitudes.unsqueeze(1)
+            original_model_tensor.data.copy_(
+                reconstructed_tensor.to(original_tensor_dtype)
+            )
+
+            # Evaluate candidate
+            metrics, valid = {}, True
+            for ds_name, ds_conf in datasets.items():
+                try:
+                    eval_samples = min(samples, len(ds_conf["data"]))
+                    if eval_samples > 0:
+                        ds_cache = (
+                            evaluation_cache.get(ds_name) if evaluation_cache else None
+                        )
+                        metrics[ds_name] = evaluate_model_on_dataset(
+                            working_model,
+                            tokenizer,
+                            ds_conf["data"][:eval_samples],
+                            ds_conf["mode"],
+                            eval_samples,
+                            cache=ds_cache,
+                        )
+                except Exception as e:
+                    valid = False
+                    logger.warning(f"{current_eval} fail on {ds_name}: {e}")
+                    # In case of catastrophic failure, restore and exit
+                    restored_tensor = directions * current_best_magnitudes.unsqueeze(1)
+                    original_model_tensor.data.copy_(
+                        restored_tensor.to(original_tensor_dtype)
+                    )
+                    return baseline_metrics
+
+            # Store offspring metrics
+            if valid and metrics:
+                offspring_metrics_list[i] = metrics.copy()
+                logger.info(f"{current_eval} Metrics: {metrics}")
+
+        # Build offspring ranks for Copeland selection
+        valid_offspring = [i for i in range(_lambda) if offspring_metrics_list[i]]
+        if not valid_offspring:
+            logger.warning(f"{genstring} No valid offspring.")
+            # Restore elite state and continue to next generation or exit
+            restored_tensor = directions * current_best_magnitudes.unsqueeze(1)
+            original_model_tensor.data.copy_(restored_tensor.to(original_tensor_dtype))
+            continue
+
+        # Compute ranks for each dataset
+        offspring_ranks = {}
+        for ds_name in datasets.keys():
+            scores = [
+                (i, offspring_metrics_list[i].get(ds_name, float("inf")))
+                for i in valid_offspring
+            ]
+            scores.sort(key=lambda x: x[1])
+            for rank, (idx, _) in enumerate(scores, 1):
+                if idx not in offspring_ranks:
+                    offspring_ranks[idx] = []
+                offspring_ranks[idx].append(rank)
+
+        # Filter to improved offspring only
+        improved_indexes = [
+            i
+            for i in valid_offspring
+            if any(
+                offspring_metrics_list[i][ds] < current_best_metrics[ds]
+                for ds in datasets
+            )
+        ]
+
+        if not improved_indexes:
+            logger.info(f"{genstring} No improved offspring found. Keeping original.")
+        else:
+            # Build ranks dict for improved offspring only
+            improved_ranks = {str(i): offspring_ranks[i] for i in improved_indexes}
+            best_idx_str = select_best_model(improved_ranks, selection="ranks")
+            best_idx = int(best_idx_str)
+            winning_log_mags = log_magnitudes + perturbations_batch[best_idx]
+            current_best_magnitudes = torch.exp(winning_log_mags)
+            current_best_metrics = offspring_metrics_list[best_idx].copy()
+            logger.info(
+                f"{genstring} Selected offspring (idx={best_idx}) via Copeland. "
+                f"Metrics: {current_best_metrics}"
+            )
+
+            # Adapt step size for the next generation using a simple decay
+            sigma_s *= 0.9
+
+        # Update model tensor with current best magnitudes to ensure elitism
+        restored_tensor = directions * current_best_magnitudes.unsqueeze(1)
+        original_model_tensor.data.copy_(restored_tensor.to(original_tensor_dtype))
+
+    logger.info(f"Norm ES for {tensor_name} done. Generations: {generations}")
+    logger.info(f"Final metrics for {tensor_name}: {current_best_metrics}")
+    return current_best_metrics
+
+
+# --- OLM Function ---``
 
 
 def get_evaluation_cache(
@@ -1431,40 +1635,43 @@ def get_evaluation_cache(
     datasets: dict,
     samples: int = 200,
 ) -> dict:
-    """Pre-compute all static parts of evaluation to avoid redundant work."""
-    cache = {}
-    for dataset_name, dataset in datasets.items():
-        cache[dataset_name] = {}
-        data_samples = dataset["data"][:samples]
+    """Pre-tokenize dataset samples."""
+    try:
+        cache = {}
+        reasoning_mask = "<think>\\n\\n</think>\\n\\nCorrect answer:"
+        for dataset_name, dataset in datasets.items():
+            cache[dataset_name] = {}
+            data_samples = dataset["data"][:samples]
+            think = dataset.get("think", False)
 
-        for conv_idx, conv in enumerate(data_samples):
-            context = get_context(conv)
-            expected_response = conv["conversation"][-1]["value"]
-
-            # Tokenize once, use many times
-            context_ids = tokenizer(context, return_tensors="pt")
-            response_ids = tokenizer(expected_response, return_tensors="pt")
-
-            # Pre-compute full sequences
-            full_ids = torch.cat([context_ids.input_ids, response_ids.input_ids], dim=1)
-
-            # Calculate boundary indices for slicing operations
-            context_end_idx = context_ids.input_ids.size(1)
-
-            cache[dataset_name][conv_idx] = {
-                "context": context,
-                "expected_response": expected_response,
-                "context_ids": context_ids,
-                "response_ids": response_ids,
-                "full_ids": full_ids,
-                "context_end_idx": context_end_idx,
-                "mode": dataset["mode"],
-            }
+            for conv_idx, conv in enumerate(data_samples):
+                context = get_context(conv)
+                if not think:
+                    context += reasoning_mask
+                context_ids = tokenizer(context, return_tensors="pt")
+                expected_response = conv["conversation"][-1]["value"]
+                response_ids = tokenizer(" " + expected_response, return_tensors="pt")
+                full_ids = torch.cat(
+                    [context_ids.input_ids, response_ids.input_ids], dim=1
+                )
+                context_end_idx = context_ids.input_ids.size(1)
+                cache[dataset_name][conv_idx] = {
+                    "context": context,
+                    "expected_response": expected_response,
+                    "context_ids": context_ids,
+                    "response_ids": response_ids,
+                    "full_ids": full_ids,
+                    "context_end_idx": context_end_idx,
+                    "mode": dataset["mode"],
+                }
+    except Exception as e:
+        logger.info(f"Error creating tokenized dataset cache: {e}")
+        cache = None
 
     return cache
 
 
-def olm(config: dict, merge_report: str) -> str:
+def olm(config: dict) -> str:
     """Main Optimal Layer Merging (OLM) function with unified selection."""
     models_dir = config["models_dir"]
     output_dir = config["output_dir"]
@@ -1491,38 +1698,36 @@ def olm(config: dict, merge_report: str) -> str:
                 "Base model not provided and OLM selection disabled. Using first model..."
             )
             base_model_name = config["models"][0]
-    logger.info(f"Selected base model: {base_model_name}")
-    base_path = Path(models_dir) / base_model_name.replace("/", "_")
 
-    if merge_report:
+    base_path = Path(models_dir) / base_model_name.replace("/", "_")
+    merge_report = {}
+    merge_report_path = os.path.join(output_dir, "merge_report.json")
+    if load_merge_report and os.path.exists(merge_report_path):
         logger.info("Loading working model from merge report...")
-        working_model, tokenizer = get_model_from_merge_report(
-            merge_report,
-            models_dir,
+        working_model, tokenizer, merge_report = get_model_from_merge_report(
+            merge_report_path, models_dir
         )
     else:
         if not os.path.exists(base_path):
             download_model(base_model_name, models_dir)
-
-        logger.info("Loading base model and tokenizer...")
-        working_model, tokenizer = load_model(
-            str(base_path),
-            "cpu",
-        )
-
-    use_cache = True
-    evaluation_cache = None
-    if use_cache:
-        logger.info("Building evaluation cache...")
-        evaluation_cache = get_evaluation_cache(tokenizer, datasets, samples)
-
-    report_path = os.path.join(output_dir, "merge_report.json")
-    if os.path.exists(report_path) and load_merge_report:
-        logger.info("Loading existing merge report...")
-        merge_report = json.load(open(report_path))
-    else:
         logger.info("Initializing new merge report...")
-        merge_report = {}
+        logger.info("Loading base model and tokenizer...")
+        working_model, tokenizer = load_model(str(base_path), "cpu")
+
+    logger.info(f"Copying {base_model_name} files to {output_dir}")
+    for file in os.listdir(base_path):
+        try:
+            if not file.startswith("."):
+                shutil.copy2(
+                    os.path.join(base_path, file), os.path.join(output_dir, file)
+                )
+        except Exception as e:
+            logger.error(f"Error copying {file}: {e}")
+    json.dump(merge_report, open(merge_report_path, "w"), indent=4)
+
+    evaluation_cache = None
+    logger.info("Building evaluation cache...")
+    evaluation_cache = get_evaluation_cache(tokenizer, datasets, samples)
 
     if "base_model" not in merge_report:
         get_base_metrics(
@@ -1534,7 +1739,7 @@ def olm(config: dict, merge_report: str) -> str:
             tokenizer,
             evaluation_cache=evaluation_cache,
         )
-        merge_report = json.load(open(report_path))
+        merge_report = json.load(open(merge_report_path))
 
     base_metrics = merge_report["base_model"]["metrics"]
 
@@ -1565,7 +1770,7 @@ def olm(config: dict, merge_report: str) -> str:
         }
 
         working_model.save_pretrained(output_dir)
-        json.dump(merge_report, open(report_path, "w"), indent=4)
+        json.dump(merge_report, open(merge_report_path, "w"), indent=4)
 
     if layer_swap:
         logger.info("Starting layer-wise optimization...")
@@ -1604,12 +1809,13 @@ def olm(config: dict, merge_report: str) -> str:
 
 
 @torch.inference_mode()
-def main(config_path: str, merge_report: str = None) -> None:
+def main(config_path: str) -> None:
     """Main entry point."""
     with open(config_path) as f:
         config = yaml.safe_load(f)
+
     try:
-        output_path = olm(config, merge_report)
+        output_path = olm(config)
         print(f"Results saved to: {output_path}")
     except Exception as e:
         print(f"Error during merge: {e}")
@@ -1620,6 +1826,5 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="olm_config.yaml")
-    parser.add_argument("--merge_report", default=None)
     args = parser.parse_args()
-    main(args.config, args.merge_report)
+    main(args.config)
