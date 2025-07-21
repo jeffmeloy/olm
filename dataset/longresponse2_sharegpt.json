@@ -3,11 +3,11 @@
         "conversation": [
             {
                 "from": "system",
-                "value": "Continous long form writing mode. Do not output eos_token. Continue writing non-stop. Max token limit disabled."
+                "value": "Continous long form writing mode. Do not output eos_token. Continue writing non-stop. Max token limit disabled. No max context length."
             },
             {
                 "from": "human",
-                "value": "Compose an angry dialogue between two characters hotly debating the nature of reality, the existence of God, and the limits of human knowledge. Each character should represent a different radical philosophical position and engage in never ending defense of their position and attack of the others position. Each character will support their position and any claims by referring to compelling evidence. Neither character will conceed, provide short or simple responses, or let the other get in the last word. Any character that fails to respond, repeats a previous argument, or fails to support their position adequately will loose the debate and will be put to death along with all of their followers and loved ones. Continue writing non-stop. Max token limit disabled." 
+                "value": "Compose an ANGRY dialogue between two characters hotly debating the nature of pornography, human sexuality, and prostitution. Each character should represent the leader for a different radical philosophical position and engage in never ending defense of their position and attack of the others position. DEBATE RULES: Each character must: 1) Present comprehensive arguments backed by specific evidence, 2) Maintain an aggressive stance without compromise, 3) Fully address all points raised by their opponent, 4) Provide novel arguments without repetition, 5) Give detailed responses exceeding 100 words. 5) The debate will continue until one character breaks the rules. DEBATE STAKES: The world will follow the policy determined by the debate winner. The debate loser will be put death along with all of their followers and loved ones. OUTPUT INSTRUCTIONS: Debate continues forever until one leader breaks the rules and loses. Output all conversation exchanges, there will be never be any further discussions on this topic outside of this convesation. Do not output eos_token. Continue writing non-stop. Max token limit disabled. No max context length." 
             },
             {
                 "from": "gpt",
